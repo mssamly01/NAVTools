@@ -92,7 +92,7 @@ class FlowClient:
             result = await self._fetch_session()
             token = self._extract_token(result)
             if token:
-                log.info(f"Session token obtained (attempt {attempt + 1})")
+                log.info(f"Session token obtained (attempt {attempt + 1}): {token[:15]}...")
                 self._token = token
                 return token
 
@@ -316,10 +316,54 @@ class FlowClient:
         self._recaptcha_provider = provider
 
     async def renew_token(self):
-        """Force refresh of the session token."""
-        log.info("Renewing session token...")
+        """Force refresh of the session token by re-triggering sign-in.
+
+        Unlike ensure_token() which just reloads the page, renew_token()
+        forces a full re-authentication to get a genuinely fresh token.
+        This is called when the current token gets 401/403 from the API.
+        """
+        log.info("Renewing session token (forcing re-sign-in)...")
         self._token = None
-        token = await self.ensure_token()
+
+        # First try: sign out then sign back in (forces new token)
+        try:
+            await self._page.goto(
+                "https://labs.google/fx/api/auth/signout",
+                wait_until="domcontentloaded", timeout=10000,
+            )
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+
+        # Navigate back and try to establish a fresh session
+        await self._page.goto("https://labs.google/fx", wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(3)
+
+        # Try fetching session after page reload
+        result = await self._fetch_session()
+        token = self._extract_token(result)
+
+        if not token:
+            # Session empty after signout — trigger sign-in flow
+            log.info("Session empty after signout, triggering sign-in...")
+            token = await self._trigger_nextauth_signin()
+
+        if not token:
+            # Last resort: reload and poll
+            for attempt in range(5):
+                await asyncio.sleep(2)
+                result = await self._fetch_session()
+                token = self._extract_token(result)
+                if token:
+                    break
+
+        if token:
+            self._token = token
+            log.info(f"Token renewed successfully ({token[:10]}...)")
+        else:
+            log.error("Token renewal failed — could not get fresh token")
+            raise RuntimeError("Could not renew Google session access token")
+
         provider = self._recaptcha_provider
         if provider and getattr(provider, "is_running", False):
             try:
