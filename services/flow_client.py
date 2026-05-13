@@ -73,6 +73,119 @@ class FlowClient:
         self._recaptcha_provider = None
         self._recaptcha_fail_count = 0
 
+    async def _fetch_session_token(self):
+        """Fetch access token from NextAuth session endpoint. Returns token or None."""
+        try:
+            result = await self._page.evaluate(
+                """async (url) => {
+                    const r = await fetch(url, {credentials: "include"});
+                    if (!r.ok) return {error: r.status};
+                    return await r.json();
+                }""",
+                self.SESSION_URL,
+            )
+            token = (result or {}).get("accessToken") or (result or {}).get("access_token")
+            if token:
+                log.info("Session token obtained")
+                return token
+            log.debug(f"Session response (no token): {json.dumps(result, ensure_ascii=False)[:300]}")
+        except Exception as e:
+            log.debug(f"Session fetch error: {e}")
+        return None
+
+    async def _try_sign_in(self):
+        """Attempt Google sign-in on labs.google via popup or redirect."""
+        selectors = [
+            'a[href*="accounts.google.com"]',
+            'button:has-text("Sign in")',
+            'a:has-text("Sign in")',
+            'button:has-text("Đăng nhập")',
+            'a:has-text("Đăng nhập")',
+            '[data-action="sign-in"]',
+        ]
+
+        btn = None
+        for sel in selectors:
+            try:
+                btn = await self._page.query_selector(sel)
+                if btn and await btn.is_visible():
+                    log.info(f"Found sign-in button: {sel}")
+                    break
+                btn = None
+            except Exception:
+                btn = None
+
+        if not btn:
+            log.warning("No sign-in button found on page")
+            return False
+
+        # Try 1: popup flow (Google OAuth opens in new window)
+        try:
+            log.info("Attempting sign-in via popup...")
+            async with self._page.context.expect_page(timeout=5000) as page_info:
+                await btn.click()
+            popup = await page_info.value
+            log.info(f"Popup opened: {popup.url[:80]}")
+            # Google cookies should auto-complete the OAuth flow
+            try:
+                await popup.wait_for_event("close", timeout=30000)
+                log.info("Sign-in popup closed")
+            except Exception:
+                # Popup didn't close — try to select account if prompted
+                try:
+                    account_btn = await popup.query_selector(
+                        '[data-email], .JDAKTe, div[role="link"]'
+                    )
+                    if account_btn:
+                        log.info("Clicking account in popup...")
+                        await account_btn.click()
+                        await popup.wait_for_event("close", timeout=15000)
+                except Exception as e:
+                    log.warning(f"Popup interaction failed: {e}")
+                    try:
+                        await popup.close()
+                    except Exception:
+                        pass
+            # Wait for main page to process the sign-in
+            await asyncio.sleep(3)
+            return True
+        except Exception as e:
+            log.info(f"Popup flow failed ({e}), trying redirect...")
+
+        # Try 2: redirect flow (page navigates to Google sign-in)
+        try:
+            await btn.click()
+            await asyncio.sleep(2)
+
+            current_url = self._page.url
+            if "accounts.google.com" in current_url:
+                log.info("Redirected to Google sign-in, waiting for account selection...")
+                # Try to click the account if prompted
+                try:
+                    account_el = await self._page.wait_for_selector(
+                        '[data-email], .JDAKTe, div[role="link"]',
+                        timeout=10000,
+                    )
+                    if account_el:
+                        await account_el.click()
+                        log.info("Clicked account, waiting for redirect back...")
+                except Exception:
+                    pass
+
+                # Wait for redirect back to labs.google
+                try:
+                    await self._page.wait_for_url("**/labs.google/**", timeout=30000)
+                    log.info("Redirected back to labs.google")
+                except Exception:
+                    log.warning(f"Still on: {self._page.url[:80]}")
+
+            await asyncio.sleep(3)
+            return True
+        except Exception as e:
+            log.warning(f"Redirect sign-in failed: {e}")
+
+        return False
+
     async def ensure_token(self):
         """Get ya29.* access token from NextAuth session."""
         if self._token:
@@ -80,37 +193,44 @@ class FlowClient:
 
         log.info("Getting session token...")
         if "labs.google" not in (self._page.url or ""):
-            await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)
+            await self._page.goto("https://labs.google/fx", wait_until="load", timeout=30000)
+            await asyncio.sleep(3)
 
-        try:
-            btn = await self._page.query_selector(
-                'a[href*="accounts.google.com"], button:has-text("Sign in"), a:has-text("Sign in")'
-            )
-            if btn and await btn.is_visible(timeout=15000):
-                log.info("Clicking Sign in...")
-                async with self._page.context.expect_page() as pi:
-                    await btn.click()
-                popup = await pi.value
-                await popup.wait_for_event("close", timeout=20000)
-        except Exception:
-            pass
+        # Attempt 1: session might already be valid (e.g. labs.google cookies exist)
+        token = await self._fetch_session_token()
+        if token:
+            self._token = token
+            return token
 
-        result = await self._page.evaluate(
-            """async (url) => {
-                const r = await fetch(url, {credentials: "include"});
-                if (!r.ok) return {error: r.status};
-                return await r.json();
-            }""",
-            self.SESSION_URL,
+        # Attempt 2: complete the sign-in flow
+        log.info("No session token — attempting sign-in...")
+        signed_in = await self._try_sign_in()
+
+        if signed_in:
+            # Re-navigate to ensure page is on labs.google
+            if "labs.google" not in (self._page.url or ""):
+                await self._page.goto("https://labs.google/fx", wait_until="load", timeout=30000)
+                await asyncio.sleep(3)
+
+            token = await self._fetch_session_token()
+            if token:
+                self._token = token
+                return token
+
+        # Attempt 3: try going directly to image-fx/video-fx which may trigger auth
+        log.info("Retrying via direct tool URL...")
+        await self._page.goto("https://labs.google/fx/tools/image-fx", wait_until="load", timeout=30000)
+        await asyncio.sleep(3)
+
+        token = await self._fetch_session_token()
+        if token:
+            self._token = token
+            return token
+
+        raise RuntimeError(
+            "Could not get Google session access token. "
+            "Cookies may be expired — try renewing in Settings → Tài khoản Google → Gia hạn"
         )
-        token = (result or {}).get("accessToken") or (result or {}).get("access_token")
-        if not token:
-            err = json.dumps(result, ensure_ascii=False)[:500]
-            log.error(f"Session token missing: {err}")
-            raise RuntimeError("Could not get Google session access token")
-        self._token = token
-        return token
 
     def set_recaptcha_provider(self, provider):
         """Set external reCAPTCHA token provider (SubprocessTokenProvider)."""
