@@ -1,0 +1,64 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+bin/
+include/
+lib/
+share/
+pyvenv.cfg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large files & Outputs
+image_output/
+video_output/
+ffmpeg/
+models/
+assets/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.mp3
+*.wav
+*.zip
+*.tar.gz
+*.rar
+*.7z
+*.exe
+*.msi
+
+# Local config
+.env
+config/local_config.json
