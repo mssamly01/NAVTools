@@ -1,0 +1,15 @@
+PySide6
+playwright
+httpx
+Pillow
+numpy
+torch
+torchvision
+torchaudio
+spandrel
+opencv-python
+openai-whisper
+google-genai
+gspread
+google-auth
+yt-dlp

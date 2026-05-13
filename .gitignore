@@ -44,7 +44,10 @@ Thumbs.db
 image_output/
 video_output/
 ffmpeg/
-models/
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.bin
 assets/
 *.mp4
 *.mkv
@@ -62,3 +65,4 @@ assets/
 # Local config
 .env
 config/local_config.json
+.vidgen/

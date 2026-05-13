@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from config.constants import FFMPEG_PATH
-from utils.file_utils import ensure_even_dimensions, natural_sort_key
+from utils.file_utils import natural_sort_key
 from utils.logger import log
 
 
@@ -85,10 +85,7 @@ class VideoConcatenator:
     def concat_videos(self, input_dir, output_path, pattern="*.mp4"):
         input_dir = Path(input_dir)
         files = sorted(input_dir.glob(pattern), key=lambda p: natural_sort_key(p.name))
-        normalized = []
-        for p in files:
-            normalized.append(ensure_even_dimensions(p))
-        return concat_videos(normalized, output_path)
+        return concat_videos(files, output_path)
 
     def get_video_info(self, video_path):
         """Get video metadata using ffprobe."""
