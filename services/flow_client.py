@@ -79,37 +79,49 @@ class FlowClient:
             return self._token
 
         log.info("Getting session token...")
+
+        # Step 1: Navigate to labs.google with networkidle (wait for full JS load)
         if "labs.google" not in (self._page.url or ""):
-            await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=30000)
+            await self._page.goto("https://labs.google/fx", wait_until="networkidle", timeout=30000)
+        else:
+            await self._page.reload(wait_until="networkidle", timeout=30000)
+
+        # Step 2: Poll session — page JS may auto-establish session
+        for attempt in range(5):
             await asyncio.sleep(2)
+            result = await self._fetch_session()
+            token = self._extract_token(result)
+            if token:
+                log.info(f"Session token obtained (attempt {attempt + 1})")
+                self._token = token
+                return token
 
-        # First attempt: try fetching session directly
-        result = await self._fetch_session()
-        token = self._extract_token(result)
-        if token:
-            self._token = token
-            return token
-
-        # Session empty — trigger NextAuth sign-in flow via Google OAuth
-        log.info("Session empty, initiating NextAuth sign-in flow...")
+        # Step 3: Session still empty — try sign-in strategies
+        log.info("Session empty after polling, trying sign-in strategies...")
         token = await self._trigger_nextauth_signin()
         if token:
             self._token = token
             return token
 
-        # Fallback: try clicking Sign-in button (popup flow)
+        # Step 4: Final fallback — click Sign-in button on page
         try:
+            await self._page.goto("https://labs.google/fx", wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(3)
             btn = await self._page.query_selector(
                 'a[href*="accounts.google.com"], button:has-text("Sign in"), '
-                'a:has-text("Sign in"), button:has-text("Đăng nhập")'
+                'a:has-text("Sign in"), button:has-text("Đăng nhập"), '
+                '[data-action="sign-in"]'
             )
             if btn and await btn.is_visible():
                 log.info("Clicking Sign in button...")
-                async with self._page.context.expect_page() as pi:
+                try:
+                    async with self._page.context.expect_page(timeout=5000) as pi:
+                        await btn.click()
+                    popup = await pi.value
+                    await popup.wait_for_event("close", timeout=30000)
+                except Exception:
                     await btn.click()
-                popup = await pi.value
-                await popup.wait_for_event("close", timeout=30000)
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
                 result = await self._fetch_session()
                 token = self._extract_token(result)
                 if token:
