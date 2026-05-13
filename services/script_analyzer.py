@@ -14,13 +14,7 @@ except Exception:
 
 from services.youtube_analyzer import VEO3_CAMERA_MOVES, VEO3_SHOT_TYPES, assemble_prompt, normalize_to_whitelist
 
-try:
-    from services.youtube_analyzer import VEO_CLIP_SECONDS
-except Exception:
-    try:
-        from services.youtube_analyzer import VEO_VIDEO_LENGTH as VEO_CLIP_SECONDS
-    except Exception:
-        VEO_CLIP_SECONDS = 8
+from services.youtube_analyzer import VEO_VIDEO_LENGTH as VEO_CLIP_SECONDS
 
 
 MAX_SCRIPT_SCENES = 40

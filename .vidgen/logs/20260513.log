@@ -78,3 +78,53 @@
 2026-05-13 20:34:41,424 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
 2026-05-13 20:34:43,538 [INFO] navtools: Logged in as: user
 2026-05-13 20:34:44,001 [INFO] navtools: Application started
+2026-05-13 20:43:26,390 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:43:26,398 [INFO] navtools: Database initialized
+2026-05-13 20:43:26,398 [INFO] navtools: Theme: dark
+2026-05-13 20:43:26,400 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:43:26,452 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:43:28,220 [INFO] navtools: Login cancelled — exiting
+2026-05-13 20:44:09,145 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:44:09,150 [INFO] navtools: Database initialized
+2026-05-13 20:44:09,150 [INFO] navtools: Theme: dark
+2026-05-13 20:44:09,150 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:44:09,202 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:44:10,918 [INFO] navtools: Logged in as: user
+2026-05-13 20:44:11,395 [INFO] navtools: Application started
+2026-05-13 20:44:12,653 [WARNING] navtools: Could not load accounts: no such column: token_exp
+2026-05-13 20:44:16,740 [INFO] navtools: Application closed
+2026-05-13 20:47:32,021 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:47:33,414 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:47:33,416 [INFO] navtools: Database initialized
+2026-05-13 20:47:33,417 [INFO] navtools: Theme: dark
+2026-05-13 20:47:33,417 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:47:33,517 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:47:35,205 [INFO] navtools: Login cancelled — exiting
+2026-05-13 20:47:38,000 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:47:38,001 [INFO] navtools: Database initialized
+2026-05-13 20:47:38,001 [INFO] navtools: Theme: dark
+2026-05-13 20:47:38,001 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:47:38,067 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:47:39,771 [INFO] navtools: Login cancelled — exiting
+2026-05-13 20:49:23,564 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:49:23,564 [INFO] navtools: Database initialized
+2026-05-13 20:49:23,564 [INFO] navtools: Theme: dark
+2026-05-13 20:49:23,564 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:49:23,658 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:50:35,471 [INFO] navtools: Login cancelled — exiting
+2026-05-13 20:50:45,791 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:50:45,791 [INFO] navtools: Database initialized
+2026-05-13 20:50:45,791 [INFO] navtools: Theme: dark
+2026-05-13 20:50:45,793 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:50:45,843 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:50:47,992 [INFO] navtools: Dev Mode: Bypassing login for user '1'
+2026-05-13 20:50:48,003 [INFO] navtools: Logged in as: user
+2026-05-13 20:50:48,476 [INFO] navtools: Application started
+2026-05-13 20:52:29,504 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:52:29,514 [INFO] navtools: Database initialized
+2026-05-13 20:52:29,514 [INFO] navtools: Theme: dark
+2026-05-13 20:52:29,515 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:52:29,564 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:52:31,577 [INFO] navtools: Dev Mode: Bypassing login for user '1'
+2026-05-13 20:52:31,587 [INFO] navtools: Logged in as: user
+2026-05-13 20:52:32,056 [INFO] navtools: Application started

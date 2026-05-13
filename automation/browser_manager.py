@@ -35,7 +35,7 @@ class BrowserManager:
     GOOGLE_FLOW_URL = "https://labs.google/fx/tools/video-fx"
     GOOGLE_IMAGE_URL = "https://labs.google/fx/tools/image-fx"
 
-    def __init__(self):
+    def __init__(self, headless: Optional[bool] = None):
         self._playwright = None
         self._playwrights = {}
         self._browsers = {}
@@ -46,6 +46,12 @@ class BrowserManager:
         self._profiles = {}
         self._next_port = 9222
         self._lock = asyncio.Lock()
+
+        if headless is None:
+            env_val = os.environ.get("NAVTOOLS_HEADLESS", "False").lower()
+            self._headless = env_val in ("true", "1", "yes")
+        else:
+            self._headless = headless
 
     async def _ensure_playwright(self):
         if not self._playwright:
@@ -121,7 +127,7 @@ class BrowserManager:
             log.info("System Chrome not found, fallback to bundled chromium")
 
         browser = await pw.chromium.launch(
-            headless=False,
+            headless=self._headless,
             executable_path=chrome_exe,
             args=[
                 "--window-position=-10000,-10000",

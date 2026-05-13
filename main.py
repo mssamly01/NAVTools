@@ -9,6 +9,10 @@ import faulthandler
 import io
 import os
 import sys
+import atexit
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 if sys.stdout is None:
     sys.stdout = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True)
@@ -47,6 +51,7 @@ try:
         _crash_dir.mkdir(parents=True, exist_ok=True)
         _crash_fp = open(_crash_dir / "crash.log", "a", buffering=1)
         faulthandler.enable(file=_crash_fp)
+        atexit.register(lambda: _crash_fp.close())
     else:
         faulthandler.enable()
 except Exception:

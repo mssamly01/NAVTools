@@ -105,6 +105,15 @@ class SettingsDialog(QDialog):
         self.accounts: list[Account] = []
         self._login_thread = None
         self._renew_thread = None
+
+        # Add signals for thread-safe UI updates
+        self.login_updated = _LoginSignals()
+        self.login_updated.success.connect(self._on_login_success_ui)
+
+        # Add signals for thread-safe UI updates
+        self.account_updated = _RenewSignals()
+        self.account_updated.success.connect(self._on_renew_success_ui)
+
         self.setWindowTitle(f"{APP_NAME} — Cài đặt hệ thống")
         self.setMinimumSize(950, 550)
         self.setModal(True)
@@ -144,9 +153,11 @@ class SettingsDialog(QDialog):
 
         self.accounts_table = QTableWidget(0, 7)
         self.accounts_table.setHorizontalHeaderLabels(["Email", "Gói", "Credit", "Cookie Exp", "Bật", "Gemini Key", "Thao tác"])
-        self.accounts_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.accounts_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.accounts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.accounts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.accounts_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.accounts_table.verticalHeader().setDefaultSectionSize(45) # Tăng chiều cao dòng
         layout.addWidget(self.accounts_table)
         tabs.addTab(tab, "🌐 Tài khoản Google")
 
@@ -230,10 +241,17 @@ class SettingsDialog(QDialog):
     def _make_action_buttons(self, account):
         box = QWidget()
         layout = QHBoxLayout(box)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(5, 2, 5, 2)
+        layout.setSpacing(5)
         renew = QPushButton("Gia hạn")
         edit = QPushButton("Sửa")
         delete = QPushButton("Xóa")
+        
+        # Đảm bảo nút có kích thước rõ ràng
+        for btn in (renew, edit, delete):
+            btn.setMinimumHeight(28)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+
         renew.clicked.connect(lambda _, a=account: self._renew_session(a))
         edit.clicked.connect(lambda _, a=account: self._edit_account(a))
         delete.clicked.connect(lambda _, a=account: self._delete_account(a))
@@ -298,10 +316,15 @@ class SettingsDialog(QDialog):
         for _ in range(180):
             info = _read_chrome_cookies(Path(BROWSER_PROFILE_DIR))
             if info.get("email"):
-                self._on_login_success(info["email"], str(BROWSER_PROFILE_DIR), info.get("cookie_exp"), None, None)
+                # Emit signal instead of calling UI methods directly
+                self.login_updated.success.emit(info["email"], str(BROWSER_PROFILE_DIR), info.get("cookie_exp"), None, None)
                 return
             await asyncio.sleep(1)
         self._on_login_failed("Đăng nhập quá thời gian chờ.")
+
+    def _on_login_success_ui(self, email, cookie_path, cookie_exp=None, token_exp=None, gemini_api_key=None):
+        """This runs in the MAIN thread."""
+        self._on_login_success(email, cookie_path, cookie_exp, token_exp, gemini_api_key)
 
     def _on_login_success(self, email, cookie_path, cookie_exp=None, token_exp=None, gemini_api_key=None):
         account = None
@@ -347,9 +370,11 @@ class SettingsDialog(QDialog):
     async def _async_renew(self, account_id, email, cookie_path, progress=None):
         await asyncio.sleep(0.5)
         info = _read_chrome_cookies(Path(cookie_path or BROWSER_PROFILE_DIR))
-        self._on_renew_success(account_id, info.get("cookie_exp"), None, info.get("email") or email)
+        # Emit signal instead of calling UI methods directly
+        self.account_updated.success.emit(account_id, info.get("cookie_exp"), None, info.get("email") or email)
 
-    def _on_renew_success(self, account_id, cookie_exp=None, token_exp=None, email=None):
+    def _on_renew_success_ui(self, account_id, cookie_exp=None, token_exp=None, email=None):
+        """This runs in the MAIN thread."""
         account = self.db.get_account(account_id)
         if account:
             account.cookie_exp = cookie_exp or account.cookie_exp
@@ -357,6 +382,10 @@ class SettingsDialog(QDialog):
             account.email = email or account.email
             self.db.update_account(account)
         self._load_accounts()
+
+    def _on_renew_success(self, account_id, cookie_exp=None, token_exp=None, email=None):
+        # Legacy method, can be kept or removed. The logic moved to _on_renew_success_ui via signal.
+        pass
 
     def _on_renew_failed(self, account_id, message):
         QMessageBox.warning(self, "Gia hạn thất bại", str(message))

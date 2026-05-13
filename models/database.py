@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from config.constants import DB_PATH
 from models.account import Account
+from utils.logger import log
 
 
 class Database:
@@ -29,7 +30,21 @@ class Database:
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
+        self._migrate()
         return self._conn
+
+    def _migrate(self):
+        """Handle schema updates for existing databases."""
+        try:
+            # Check if token_exp exists
+            cursor = self._conn.execute("PRAGMA table_info(accounts)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "token_exp" not in columns:
+                self._conn.execute("ALTER TABLE accounts ADD COLUMN token_exp TEXT")
+                self._conn.commit()
+                log.info("Migration: Added token_exp column to accounts table")
+        except Exception as e:
+            log.warning(f"Migration failed: {e}")
 
     def close(self):
         if self._conn:
@@ -80,55 +95,35 @@ class Database:
     # Account CRUD
     # ------------------------------------------------------------------
 
-<<<<<<< HEAD
     def get_accounts(self, enabled_only: bool = False) -> list[Account]:
-        sql = "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts"
+        sql = "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key, token_exp FROM accounts"
         if enabled_only:
             sql += " WHERE enabled = 1"
         rows = self._conn.execute(sql).fetchall()
         return [Account.from_row(r) for r in rows]
 
-=======
->>>>>>> 519e004cb7fbab9cb61f6cda519585e361335200
     def get_account(self, account_id: int) -> Optional[Account]:
         row = self._conn.execute(
-            "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts WHERE id = ?",
+            "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key, token_exp FROM accounts WHERE id = ?",
             (account_id,),
         ).fetchone()
         return Account.from_row(row) if row else None
 
     def add_account(self, email: str) -> Account:
-<<<<<<< HEAD
         """Create a new account with default values."""
-        account = Account(email=email)
-        self.update_account(account)
-        # Fetch back to get the autoincremented ID
-        row = self._conn.execute(
-            "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts WHERE email = ? ORDER BY id DESC LIMIT 1",
-            (email,),
-        ).fetchone()
-        return Account.from_row(row)
-=======
         cursor = self._conn.execute(
             "INSERT INTO accounts (email) VALUES (?)", (email,)
         )
         self._conn.commit()
         return Account(id=cursor.lastrowid, email=email)
 
-    def get_accounts(self, enabled_only: bool = False) -> list[Account]:
-        sql = "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts"
-        if enabled_only:
-            sql += " WHERE enabled = 1"
-        rows = self._conn.execute(sql).fetchall()
-        return [Account.from_row(r) for r in rows]
->>>>>>> 519e004cb7fbab9cb61f6cda519585e361335200
-
     def update_account(self, account: Account):
         cookie_exp_str = account.cookie_exp.isoformat() if account.cookie_exp else None
+        token_exp_str = account.token_exp.isoformat() if account.token_exp else None
         self._conn.execute(
             """INSERT OR REPLACE INTO accounts
-               (id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key, token_exp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 account.id or None,
                 account.email,
@@ -139,6 +134,7 @@ class Database:
                 account.credit,
                 int(account.enabled),
                 account.gemini_api_key,
+                token_exp_str,
             ),
         )
         self._conn.commit()
@@ -174,7 +170,8 @@ class Database:
                 tier            TEXT DEFAULT 'FREE',
                 credit          INTEGER DEFAULT 0,
                 enabled         INTEGER DEFAULT 1,
-                gemini_api_key  TEXT DEFAULT ''
+                gemini_api_key  TEXT DEFAULT '',
+                token_exp       TEXT
             );
             """
         )

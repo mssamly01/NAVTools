@@ -20,25 +20,29 @@ class Account:
     credit: int = 0
     enabled: bool = True
     gemini_api_key: str = ""
-<<<<<<< HEAD
-=======
     token_exp: Optional[datetime] = None
->>>>>>> 519e004cb7fbab9cb61f6cda519585e361335200
 
     @classmethod
     def from_row(cls, row: tuple) -> Account:
         """Create an Account from a database row tuple.
 
         Expected column order:
-          id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key
+          id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key, token_exp
         """
-        vals = list(row) + [None] * max(0, 9 - len(row))
+        vals = list(row) + [None] * max(0, 10 - len(row))
         cookie_exp = None
         if vals[4]:
             try:
                 cookie_exp = datetime.fromisoformat(str(vals[4]))
             except (ValueError, TypeError):
                 pass
+        token_exp = None
+        if vals[9]:
+            try:
+                token_exp = datetime.fromisoformat(str(vals[9]))
+            except (ValueError, TypeError):
+                pass
+
         return cls(
             id=int(vals[0] or 0),
             email=str(vals[1] or ""),
@@ -49,4 +53,5 @@ class Account:
             credit=int(vals[6] or 0),
             enabled=bool(int(vals[7] or 1)),
             gemini_api_key=str(vals[8] or ""),
+            token_exp=token_exp,
         )
