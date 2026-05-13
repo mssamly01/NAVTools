@@ -82,6 +82,66 @@ def _read_chrome_cookies(profile_dir: Path):
     return info
 
 
+def _export_cookies_for_playwright(profile_dir: Path):
+    """Export Chrome cookies to cookies_export.json for Playwright injection.
+
+    BrowserManager.get_or_create_context() reads cookies from
+    {cookie_path}/cookies_export.json — this bridges Chrome login
+    with Playwright-based Flow API automation.
+    """
+    profile_dir = Path(profile_dir)
+    cookies_db = profile_dir / "Default" / "Network" / "Cookies"
+    tmp_db = profile_dir / "cookies_export_copy.db"
+    output = profile_dir / "cookies_export.json"
+
+    if not cookies_db.exists():
+        log.warning(f"Chrome Cookies DB not found: {cookies_db}")
+        return False
+
+    try:
+        shutil.copy2(cookies_db, tmp_db)
+        conn = sqlite3.connect(str(tmp_db))
+        rows = conn.execute(
+            "SELECT name, value, host_key, path, expires_utc, is_httponly, is_secure "
+            "FROM cookies WHERE host_key LIKE '%google.com%' OR host_key LIKE '%labs.google%'"
+        ).fetchall()
+        conn.close()
+
+        chrome_epoch = datetime(1601, 1, 1)
+        cookies = []
+        for name, value, domain, path, expires_utc, is_httponly, is_secure in rows:
+            expires = -1
+            if expires_utc and expires_utc > 0:
+                try:
+                    dt = chrome_epoch + timedelta(microseconds=int(expires_utc))
+                    expires = int(dt.timestamp())
+                except Exception:
+                    pass
+            cookies.append({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": path or "/",
+                "expires": expires,
+                "httpOnly": bool(is_httponly),
+                "secure": bool(is_secure),
+                "sameSite": "Lax",
+            })
+
+        with open(output, "w", encoding="utf-8") as f:
+            json.dump(cookies, f)
+        log.info(f"Exported {len(cookies)} cookies to {output}")
+        return True
+    except Exception as e:
+        log.warning(f"Failed to export cookies: {e}")
+        return False
+    finally:
+        try:
+            os.remove(tmp_db)
+        except Exception:
+            pass
+
+
 class _LoginSignals(QObject):
     success = Signal(str, str, object, object, object)
     status = Signal(str)
@@ -316,6 +376,7 @@ class SettingsDialog(QDialog):
         for _ in range(180):
             info = _read_chrome_cookies(Path(BROWSER_PROFILE_DIR))
             if info.get("email"):
+                _export_cookies_for_playwright(Path(BROWSER_PROFILE_DIR))
                 # Emit signal instead of calling UI methods directly
                 self.login_updated.success.emit(info["email"], str(BROWSER_PROFILE_DIR), info.get("cookie_exp"), None, None)
                 return
@@ -369,7 +430,9 @@ class SettingsDialog(QDialog):
 
     async def _async_renew(self, account_id, email, cookie_path, progress=None):
         await asyncio.sleep(0.5)
-        info = _read_chrome_cookies(Path(cookie_path or BROWSER_PROFILE_DIR))
+        profile = Path(cookie_path or BROWSER_PROFILE_DIR)
+        info = _read_chrome_cookies(profile)
+        _export_cookies_for_playwright(profile)
         # Emit signal instead of calling UI methods directly
         self.account_updated.success.emit(account_id, info.get("cookie_exp"), None, info.get("email") or email)
 

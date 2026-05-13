@@ -261,13 +261,16 @@ def main():
     except Exception as e:
         log.warning(f"Splash not shown: {e}")
 
+    from automation.browser_manager import BrowserManager
     from ui.main_window import MainWindow
+
+    browser_manager = BrowserManager()
 
     try:
         if splash:
             splash.set_progress(40, "Tải các trang chính...")
 
-        window = MainWindow(db=db, settings=settings)
+        window = MainWindow(db=db, settings=settings, browser_manager=browser_manager)
         window.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {current_user}")
 
         if splash:

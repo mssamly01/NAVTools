@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import time
+import uuid
+from pathlib import Path
+
 from PySide6.QtCore import QObject, QRunnable, QThread, QThreadPool, Signal
+
+from utils.logger import log
 
 
 class WorkerSignals(QObject):
@@ -74,32 +81,149 @@ class TaskWorker(QThread):
         self._paused = False
 
     def run(self):
+        task = self.task
+        task_id = id(task) if isinstance(task, dict) else getattr(task, "id", 0)
         try:
-            self._execute()
+            asyncio.run(self._async_execute(task, task_id))
         except Exception as e:
-            self.signals.task_error.emit(getattr(self.task, "id", 0), str(e))
+            log.error(f"Task {task_id} error: {e}")
+            self.signals.task_error.emit(task_id, str(e))
 
-    def _execute(self):
-        task_id = getattr(self.task, "id", 0)
+    async def _async_execute(self, task, task_id):
         self.signals.task_started.emit(task_id)
-        items = getattr(self.task, "items", []) or []
-        total = len(items)
-        for i, item in enumerate(items, 1):
+
+        if isinstance(task, dict):
+            prompts = task.get("prompts", [])
+            mode = task.get("mode", "image")
+            output_folder = task.get("output_folder", "")
+        else:
+            prompts = getattr(task, "prompts", []) or []
+            items = getattr(task, "items", None)
+            if items and not prompts:
+                prompts = [getattr(it, "prompt", "") for it in items if getattr(it, "prompt", "")]
+            mode = getattr(task, "mode", "image")
+            output_folder = getattr(task, "output_folder", "")
+
+        if not prompts:
+            self.signals.task_error.emit(task_id, "Không có prompt nào để xử lý")
+            return
+
+        total = len(prompts)
+        account = self.account_pool.acquire() if self.account_pool else None
+        if not account:
+            self.signals.task_error.emit(task_id, "Không có tài khoản Google khả dụng. Hãy thêm và đăng nhập tài khoản trong Cài đặt.")
+            return
+
+        try:
+            await self._process_prompts(task, prompts, account, mode, output_folder, task_id, total)
+        finally:
+            if self.account_pool:
+                self.account_pool.release(account)
+            if self.browser_manager:
+                try:
+                    await self.browser_manager.close_context(account.id)
+                except Exception:
+                    pass
+
+        self.signals.task_completed.emit(task_id)
+
+    async def _process_prompts(self, task, prompts, account, mode, output_folder, task_id, total):
+        from services.flow_client import FlowClient
+
+        if not self.browser_manager:
+            self.signals.task_error.emit(task_id, "BrowserManager chưa được khởi tạo")
+            return
+
+        is_video = mode in ("video_plain", "char_video", "video_ref", "frame_video")
+        url = "https://labs.google/fx/tools/video-fx" if is_video else "https://labs.google/fx/tools/image-fx"
+
+        try:
+            page = await self.browser_manager.get_page(
+                account_id=account.id,
+                email=account.email,
+                proxy=account.proxy,
+                cookie_path=account.cookie_path,
+                url=url,
+            )
+        except Exception as e:
+            self.signals.task_error.emit(task_id, f"Không thể kết nối trình duyệt: {e}")
+            return
+
+        client = FlowClient(page, cookie_path=account.cookie_path, account_email=account.email)
+
+        config = task if isinstance(task, dict) else {}
+        aspect_ratio = config.get("aspect_ratio", "16:9")
+        quality = config.get("quality", "720p")
+        model = config.get("model") or config.get("image_model") or ("veo-3.1-fast" if is_video else "Nano Banana 2")
+        char_images = config.get("character_images", {})
+        per_row_images = config.get("per_row_character_images", {})
+        output_dir = Path(output_folder) if output_folder else Path.home() / ".vidgen" / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, prompt_data in enumerate(prompts):
             if self._cancelled:
                 break
             while self._paused and not self._cancelled:
-                time.sleep(0.2)
-            self._run_one(item)
-            self.signals.task_progress.emit(task_id, i, total)
-        self.signals.task_completed.emit(task_id)
+                await asyncio.sleep(0.2)
 
-    def _run_one(self, item):
-        return self._process_item(item)
+            prompt_text = prompt_data if isinstance(prompt_data, str) else prompt_data.get("prompt", "")
+            item_id = i + 1
+            self.signals.item_status_changed.emit(item_id, "RUNNING")
 
-    def _process_item(self, item):
-        item_id = getattr(item, "id", 0)
-        self.signals.item_status_changed.emit(item_id, "RUNNING")
-        self.signals.item_completed.emit(item_id, getattr(item, "output_path", "") or "")
+            image_paths = []
+            row_imgs = per_row_images.get(i, {}) if per_row_images else {}
+            imgs = row_imgs or char_images
+            if imgs:
+                image_paths = [v for v in imgs.values() if v and Path(v).exists()]
+
+            try:
+                if is_video:
+                    gen_id = await client.generate_video(
+                        prompt=prompt_text,
+                        image_paths=image_paths or None,
+                        model=model,
+                        aspect_ratio=aspect_ratio,
+                        quality=quality,
+                    )
+                    if isinstance(gen_id, str):
+                        out_file = output_dir / f"video_{i+1:03d}_{uuid.uuid4().hex[:6]}.mp4"
+                        await client.download_video(gen_id, str(out_file))
+                        self.signals.item_completed.emit(item_id, str(out_file))
+                    else:
+                        self.signals.item_completed.emit(item_id, "")
+                else:
+                    result = await client.generate_image(
+                        prompt=prompt_text,
+                        image_paths=image_paths or None,
+                        model=model,
+                        aspect_ratio=aspect_ratio,
+                    )
+                    out_file = output_dir / f"image_{i+1:03d}_{uuid.uuid4().hex[:6]}.png"
+                    image_data = result.get("encodedImage") or result.get("imageBytes") or ""
+                    if image_data:
+                        out_file.parent.mkdir(parents=True, exist_ok=True)
+                        with open(out_file, "wb") as f:
+                            f.write(base64.b64decode(image_data))
+                        self.signals.item_completed.emit(item_id, str(out_file))
+                    else:
+                        download_url = result.get("url") or result.get("uri") or ""
+                        if download_url:
+                            await client.download_result(download_url, str(out_file))
+                            self.signals.item_completed.emit(item_id, str(out_file))
+                        else:
+                            self.signals.item_completed.emit(item_id, "")
+                            log.warning(f"No image data in response for prompt {i+1}")
+
+                credits = client._last_remaining_credits
+                if credits is not None and self.db:
+                    self.db.update_account_credit(account.id, credits)
+                    self.signals.credit_updated.emit(account.id, credits)
+
+            except Exception as e:
+                log.error(f"Prompt {i+1} failed: {e}")
+                self.signals.item_error.emit(item_id, str(e))
+
+            self.signals.task_progress.emit(task_id, i + 1, total)
 
 
 class UpscaleSignals(QObject):
