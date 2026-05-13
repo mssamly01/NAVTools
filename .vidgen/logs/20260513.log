@@ -63,3 +63,18 @@
 2026-05-13 20:19:37,329 [INFO] navtools: PromptTable: start with 1 prompts, refs=0
 2026-05-13 20:19:42,948 [INFO] navtools: PromptTable: start with 1 prompts, refs=0
 2026-05-13 20:33:17,534 [INFO] navtools: Application closed
+2026-05-13 20:34:03,859 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:34:03,861 [INFO] navtools: Database initialized
+2026-05-13 20:34:03,861 [INFO] navtools: Theme: dark
+2026-05-13 20:34:03,861 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:34:03,914 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:34:08,302 [INFO] navtools: Logged in as: user
+2026-05-13 20:34:08,718 [WARNING] navtools: No enabled accounts configured
+2026-05-13 20:34:08,777 [INFO] navtools: Application started
+2026-05-13 20:34:41,364 [INFO] navtools: NAV TOOLS v2.0.0 starting...
+2026-05-13 20:34:41,373 [INFO] navtools: Database initialized
+2026-05-13 20:34:41,373 [INFO] navtools: Theme: dark
+2026-05-13 20:34:41,373 [INFO] navtools: cleanup orphan resources: killed=0, removed=0
+2026-05-13 20:34:41,424 [INFO] navtools: API auth service initialized (base_url=https://workspace.navtools.vn)
+2026-05-13 20:34:43,538 [INFO] navtools: Logged in as: user
+2026-05-13 20:34:44,001 [INFO] navtools: Application started
