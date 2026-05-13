@@ -1,4 +1,4 @@
-"""NAV TOOLS — Account data model."""
+"""VidGen AI — Account model."""
 
 from __future__ import annotations
 
@@ -6,52 +6,75 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+from config.constants import AccountTier
+
 
 @dataclass
 class Account:
-    """Google account used for Flow API access."""
+    """Google account for Flow API access."""
 
     id: int = 0
     email: str = ""
-    proxy: Optional[str] = None
-    cookie_path: str = ""
-    cookie_exp: Optional[datetime] = None
-    tier: str = "FREE"
-    credit: int = 0
     enabled: bool = True
-    gemini_api_key: str = ""
+    tier: str = AccountTier.FREE
+    credit: int = 0
+    proxy: Optional[str] = None
+    cookie_path: Optional[str] = None
+    cookie_exp: Optional[datetime] = None
     token_exp: Optional[datetime] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    gemini_api_key: Optional[str] = None
+
+    @property
+    def display_email(self) -> str:
+        """Truncated email for UI display."""
+        if len(self.email) > 18:
+            return self.email[:15] + "..."
+        return self.email
+
+    @property
+    def has_credits(self) -> bool:
+        return self.credit > 0
+
+    @property
+    def is_expired(self) -> bool:
+        if not self.cookie_exp:
+            return False
+        return datetime.now() > self.cookie_exp
+
+    @property
+    def is_available(self) -> bool:
+        """Account is usable for generation."""
+        return self.enabled and not self.is_expired
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "email": self.email,
+            "enabled": self.enabled,
+            "tier": self.tier,
+            "credit": self.credit,
+            "proxy": self.proxy,
+            "cookie_path": self.cookie_path,
+            "cookie_exp": self.cookie_exp.isoformat() if self.cookie_exp else None,
+            "token_exp": self.token_exp.isoformat() if self.token_exp else None,
+            "created_at": self.created_at.isoformat(),
+            "gemini_api_key": self.gemini_api_key,
+        }
 
     @classmethod
     def from_row(cls, row: tuple) -> Account:
-        """Create an Account from a database row tuple.
-
-        Expected column order:
-          id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key, token_exp
-        """
-        vals = list(row) + [None] * max(0, 10 - len(row))
-        cookie_exp = None
-        if vals[4]:
-            try:
-                cookie_exp = datetime.fromisoformat(str(vals[4]))
-            except (ValueError, TypeError):
-                pass
-        token_exp = None
-        if vals[9]:
-            try:
-                token_exp = datetime.fromisoformat(str(vals[9]))
-            except (ValueError, TypeError):
-                pass
-
+        """Create Account from SQLite row."""
         return cls(
-            id=int(vals[0] or 0),
-            email=str(vals[1] or ""),
-            proxy=vals[2] or None,
-            cookie_path=str(vals[3] or ""),
-            cookie_exp=cookie_exp,
-            tier=str(vals[5] or "FREE"),
-            credit=int(vals[6] or 0),
-            enabled=bool(int(vals[7] or 1)),
-            gemini_api_key=str(vals[8] or ""),
-            token_exp=token_exp,
+            id=row[0],
+            email=row[1],
+            enabled=bool(row[2]),
+            tier=row[3] or AccountTier.FREE,
+            credit=row[4] or 0,
+            proxy=row[5],
+            cookie_path=row[6],
+            cookie_exp=datetime.fromisoformat(row[7]) if row[7] else None,
+            token_exp=datetime.fromisoformat(row[9]) if len(row) > 9 and row[9] else None,
+            created_at=datetime.fromisoformat(row[8]) if row[8] else datetime.now(),
+            gemini_api_key=row[10] if len(row) > 10 else None,
         )

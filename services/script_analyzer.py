@@ -14,7 +14,13 @@ except Exception:
 
 from services.youtube_analyzer import VEO3_CAMERA_MOVES, VEO3_SHOT_TYPES, assemble_prompt, normalize_to_whitelist
 
-from services.youtube_analyzer import VEO_VIDEO_LENGTH as VEO_CLIP_SECONDS
+try:
+    from services.youtube_analyzer import VEO_CLIP_SECONDS
+except Exception:
+    try:
+        from services.youtube_analyzer import VEO_VIDEO_LENGTH as VEO_CLIP_SECONDS
+    except Exception:
+        VEO_CLIP_SECONDS = 8
 
 
 MAX_SCRIPT_SCENES = 40
@@ -219,8 +225,8 @@ class ScriptAnalyzer:
 
         out_scenes = []
         for idx, raw in enumerate(ai_scenes, 1):
-            shot_type = normalize_to_whitelist(raw.get("shot_type", ""), VEO3_SHOT_TYPES, "medium shot")
-            camera_move = normalize_to_whitelist(raw.get("camera_move", ""), VEO3_CAMERA_MOVES, "static tripod shot")
+            shot_type = normalize_to_whitelist(raw.get("shot_type", ""), VEO3_SHOT_TYPES)
+            camera_move = normalize_to_whitelist(raw.get("camera_move", ""), VEO3_CAMERA_MOVES)
             subject_desc = _strip_planning_rules_for_veo(raw.get("subject_desc", ""))
             vi_caption = raw.get("vi_caption", "") or raw.get("narration", "")
             allowed_aliases = set(aliases)
@@ -327,8 +333,8 @@ class ScriptAnalyzer:
         )
         raw = response.text or ""
         data = json.loads(_strip_json_fence(raw))
-        shot_type = normalize_to_whitelist(data.get("shot_type", ""), VEO3_SHOT_TYPES, "medium shot")
-        camera_move = normalize_to_whitelist(data.get("camera_move", ""), VEO3_CAMERA_MOVES, "static tripod shot")
+        shot_type = normalize_to_whitelist(data.get("shot_type", ""), VEO3_SHOT_TYPES)
+        camera_move = normalize_to_whitelist(data.get("camera_move", ""), VEO3_CAMERA_MOVES)
         subject_desc = _strip_planning_rules_for_veo(data.get("subject_desc", ""))
         vi_caption = data.get("vi_caption", "")
         allowed_aliases = set(aliases)

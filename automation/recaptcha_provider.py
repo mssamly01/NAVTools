@@ -61,6 +61,10 @@ _CDP_PORT = 9333
 class SubprocessTokenProvider:
     """Harvest reCAPTCHA tokens from a separate real Chrome via CDP."""
 
+    __static_attributes__ = (
+        '_browser', '_chrome_proc', '_context', '_page', '_playwright', '_temp_profile'
+    )
+
     def __init__(self):
         self._playwright = None
         self._browser = None

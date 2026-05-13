@@ -122,10 +122,10 @@ class FlowClient:
         self._token = None
         token = await self.ensure_token()
         provider = self._recaptcha_provider
-        if provider and getattr(provider, "is_running", False):
+        if provider and getattr(provider, "is_running", lambda: False)():
             try:
                 cookies = await self._page.context.cookies()
-                await provider.refresh_cookies(cookies)
+                provider.refresh_cookies(cookies)
             except Exception as e:
                 log.warning(f"Failed to refresh provider cookies: {e}")
         return token

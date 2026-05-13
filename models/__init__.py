@@ -1,1 +1,1 @@
-"""Data models package."""
+"""Package init."""
