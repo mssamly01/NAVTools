@@ -408,10 +408,23 @@ class FlowClient:
 
         return False
 
+    def _page_alive(self):
+        """Return True if the Playwright page is still usable."""
+        try:
+            return self._page is not None and not self._page.is_closed()
+        except Exception:
+            return False
+
     async def ensure_token(self):
         """Get ya29.* access token from NextAuth session."""
         if self._token:
             return self._token
+
+        if not self._page_alive():
+            raise RuntimeError(
+                "Browser page has been closed. "
+                "This usually means Chrome crashed during startup — try running again."
+            )
 
         log.info("Getting session token...")
         if "labs.google" not in (self._page.url or ""):
