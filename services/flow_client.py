@@ -346,8 +346,53 @@ class FlowClient:
             result = await self._page.evaluate(
                 """async (action) => {
                     if (!window.grecaptcha || !grecaptcha.enterprise) return {error: "grecaptcha missing"};
-                    const token = await grecaptcha.enterprise.execute(undefined, {action});
-                    return {token};
+
+                    // Find site key from multiple sources
+                    let siteKey = null;
+                    // From script src render param
+                    const scripts = document.querySelectorAll('script[src*="recaptcha"]');
+                    for (const s of scripts) {
+                        const m = s.src.match(/[?&]render=([^&]+)/);
+                        if (m && m[1] !== 'explicit') { siteKey = m[1]; break; }
+                    }
+                    // From ___grecaptcha_cfg
+                    if (!siteKey && window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
+                        const clients = window.___grecaptcha_cfg.clients;
+                        for (const id in clients) {
+                            const c = clients[id];
+                            if (c && c.sitekey) { siteKey = c.sitekey; break; }
+                            for (const k in c) {
+                                const v = c[k];
+                                if (v && typeof v === 'object') {
+                                    for (const k2 in v) {
+                                        if (v[k2] && v[k2].sitekey) { siteKey = v[k2].sitekey; break; }
+                                    }
+                                }
+                                if (siteKey) break;
+                            }
+                            if (siteKey) break;
+                        }
+                    }
+                    // From data-sitekey attribute
+                    if (!siteKey) {
+                        const el = document.querySelector('[data-sitekey]');
+                        if (el) siteKey = el.getAttribute('data-sitekey');
+                    }
+
+                    try {
+                        const token = await grecaptcha.enterprise.execute(siteKey || undefined, {action});
+                        return {token};
+                    } catch(e) {
+                        if (siteKey && e.message && e.message.includes('No reCAPTCHA clients')) {
+                            try {
+                                grecaptcha.enterprise.render(document.createElement('div'), {sitekey: siteKey});
+                                await new Promise(r => setTimeout(r, 1000));
+                                const token = await grecaptcha.enterprise.execute(siteKey, {action});
+                                return {token};
+                            } catch(e2) { return {error: e2.message}; }
+                        }
+                        return {error: e.message};
+                    }
                 }""",
                 action,
             )
