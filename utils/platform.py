@@ -64,6 +64,13 @@ def get_subprocess_flags():
     return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
+def get_subprocess_kwargs():
+    """Return a dict suitable for **kwargs unpacking with subprocess.Popen."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
 def kill_process_tree(pid):
     try:
         if os.name == "nt":
