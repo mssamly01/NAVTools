@@ -80,6 +80,20 @@ class Database:
     # Account CRUD
     # ------------------------------------------------------------------
 
+    def get_account(self, account_id: int) -> Optional[Account]:
+        row = self._conn.execute(
+            "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        return Account.from_row(row) if row else None
+
+    def add_account(self, email: str) -> Account:
+        cursor = self._conn.execute(
+            "INSERT INTO accounts (email) VALUES (?)", (email,)
+        )
+        self._conn.commit()
+        return Account(id=cursor.lastrowid, email=email)
+
     def get_accounts(self, enabled_only: bool = False) -> list[Account]:
         sql = "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts"
         if enabled_only:
