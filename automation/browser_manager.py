@@ -81,52 +81,57 @@ class BrowserManager:
         proxy: Optional[str] = None,
         cookie_path: Optional[str] = None,
     ) -> BrowserContext:
-        """Launch Playwright Chromium with cookies from Chrome login profile.
+        """Launch Chrome with the login profile directory.
 
-        Login happens in real Chrome (user sees browser, logs in manually).
-        Cookies are exported to cookies_export.json in the profile dir.
-        For tasks, we use Playwright's bundled Chromium + injected cookies.
-        This avoids Chrome subprocess issues (port conflicts, profile locks).
+        Uses launch_persistent_context so Chrome loads the profile
+        directly — cookies are decrypted natively by Chrome itself.
+        This avoids the Windows DPAPI encryption issue where exporting
+        cookies from Chrome SQLite gives encrypted/empty values.
         """
         self._ref_counts[account_id] = self._ref_counts.get(account_id, 0) + 1
         self._ensure_taskbar_sweeper()
 
         if account_id in self._browsers:
-            contexts = self._browsers[account_id].contexts
+            obj = self._browsers[account_id]
+            # Persistent context: obj IS the context
+            if hasattr(obj, "pages"):
+                return obj
+            # Standard browser: get first context
+            contexts = getattr(obj, "contexts", [])
             if contexts:
                 return contexts[0]
+
+        profile_dir = cookie_path or str(BROWSER_PROFILE_DIR)
+        if not Path(profile_dir).exists():
+            raise RuntimeError(f"No browser profile for {email}. Please login first in Settings.")
+
+        self._profiles[account_id] = profile_dir
 
         if account_id not in self._playwrights:
             log.info(f"Starting Playwright for account {account_id}...")
             self._playwrights[account_id] = await async_playwright().start()
 
-        import json as _json
-
-        cookies = []
-        if cookie_path and Path(cookie_path).exists():
-            cookies_file = Path(cookie_path) / "cookies_export.json"
-            if cookies_file.exists():
-                try:
-                    with open(cookies_file, "r", encoding="utf-8") as f:
-                        cookies = _json.load(f)
-                    log.info(f"Loaded {len(cookies)} cookies from {cookies_file}")
-                except Exception as e:
-                    log.warning(f"Failed to load cookies: {e}")
-
-        if not cookies:
-            raise RuntimeError(f"No cookies for {email}. Please login/renew account first.")
-
-        self._profiles[account_id] = cookie_path or ""
         pw = self._playwrights[account_id]
 
-        log.info(f"Launching Chromium for {email}...")
+        log.info(f"Launching Chrome with profile for {email}...")
         chrome_exe = find_chrome()
         if chrome_exe:
             log.info(f"Using system Chrome: {chrome_exe}")
         else:
             log.info("System Chrome not found, fallback to bundled chromium")
 
-        browser = await pw.chromium.launch(
+        # Remove lock files that may be stale from a crashed session
+        for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lock_file = Path(profile_dir) / lock_name
+            if lock_file.exists():
+                try:
+                    lock_file.unlink()
+                    log.debug(f"Removed stale lock: {lock_name}")
+                except Exception:
+                    pass
+
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
             headless=self._headless,
             executable_path=chrome_exe,
             args=[
@@ -141,10 +146,12 @@ class BrowserManager:
                 "--disable-extensions",
                 "--disable-features=TranslateUI,GlobalMediaControls",
             ],
+            ignore_default_args=["--enable-automation"],
         )
-        self._browsers[account_id] = browser
 
-        context = await browser.new_context()
+        # For persistent context, the context IS the browser
+        self._browsers[account_id] = context.browser or context
+
         await context.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -153,8 +160,10 @@ class BrowserManager:
             Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
         """
         )
-        await context.add_cookies(cookies)
-        log.info(f"Chromium ready for {email} ({len(cookies)} cookies injected)")
+
+        all_cookies = await context.cookies()
+        google_cookies = [c for c in all_cookies if "google" in c.get("domain", "")]
+        log.info(f"Chrome ready for {email} (profile loaded, {len(google_cookies)} Google cookies available)")
         self._ensure_taskbar_sweeper()
         return context
 
@@ -271,7 +280,7 @@ class BrowserManager:
         return page
 
     async def close_context(self, account_id: int):
-        """Close CDP connection and kill Chrome process.
+        """Close persistent context and Chrome process.
 
         Uses ref counting: only actually closes when no more tasks
         are using this browser (ref count reaches 0).
@@ -288,15 +297,17 @@ class BrowserManager:
 
         if account_id in self._pages:
             try:
-                if not self._pages[account_id].is_closed():
-                    await self._pages[account_id].close()
+                page = self._pages[account_id]
+                if not page.is_closed():
+                    await page.close()
             except Exception:
                 pass
             del self._pages[account_id]
 
         if account_id in self._browsers:
             try:
-                await self._browsers[account_id].close()
+                obj = self._browsers[account_id]
+                await obj.close()
             except Exception:
                 pass
             del self._browsers[account_id]
