@@ -80,6 +80,7 @@ class Database:
     # Account CRUD
     # ------------------------------------------------------------------
 
+<<<<<<< HEAD
     def get_accounts(self, enabled_only: bool = False) -> list[Account]:
         sql = "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts"
         if enabled_only:
@@ -87,6 +88,8 @@ class Database:
         rows = self._conn.execute(sql).fetchall()
         return [Account.from_row(r) for r in rows]
 
+=======
+>>>>>>> 519e004cb7fbab9cb61f6cda519585e361335200
     def get_account(self, account_id: int) -> Optional[Account]:
         row = self._conn.execute(
             "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts WHERE id = ?",
@@ -95,6 +98,7 @@ class Database:
         return Account.from_row(row) if row else None
 
     def add_account(self, email: str) -> Account:
+<<<<<<< HEAD
         """Create a new account with default values."""
         account = Account(email=email)
         self.update_account(account)
@@ -104,6 +108,20 @@ class Database:
             (email,),
         ).fetchone()
         return Account.from_row(row)
+=======
+        cursor = self._conn.execute(
+            "INSERT INTO accounts (email) VALUES (?)", (email,)
+        )
+        self._conn.commit()
+        return Account(id=cursor.lastrowid, email=email)
+
+    def get_accounts(self, enabled_only: bool = False) -> list[Account]:
+        sql = "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts"
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        rows = self._conn.execute(sql).fetchall()
+        return [Account.from_row(r) for r in rows]
+>>>>>>> 519e004cb7fbab9cb61f6cda519585e361335200
 
     def update_account(self, account: Account):
         cookie_exp_str = account.cookie_exp.isoformat() if account.cookie_exp else None
