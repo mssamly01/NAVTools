@@ -672,30 +672,75 @@ class FlowClient:
         self._last_upload_response = result
         return result.get("media") or result.get("name") or result
 
+    _VIDEO_ASPECT_MAP = {
+        "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+        "landscape": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+        "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT",
+        "portrait": "VIDEO_ASPECT_RATIO_PORTRAIT",
+    }
+
+    def _resolve_video_model_key(self, model: str, aspect_ratio: str, has_images: bool) -> str:
+        """Map user-friendly model name to the internal videoModelKey."""
+        ar = self._VIDEO_ASPECT_MAP.get(aspect_ratio, "VIDEO_ASPECT_RATIO_LANDSCAPE")
+        is_portrait = "PORTRAIT" in ar
+        suffix = "_portrait" if is_portrait else ""
+        tier_suffix = "_ultra"
+
+        key_lower = model.lower().replace(" ", "").replace("-", "_")
+        if "quality" in key_lower:
+            base = f"veo_3_1_t2v{suffix}{tier_suffix}" if not has_images else f"veo_3_1_i2v_s{suffix}{tier_suffix}"
+        elif "lite" in key_lower:
+            if "low" in key_lower or "priority" in key_lower:
+                base = f"veo_3_1_t2v_lite{suffix}_low_priority" if not has_images else f"veo_3_1_i2v_s_lite{suffix}_low_priority"
+            else:
+                base = f"veo_3_1_t2v_lite{suffix}{tier_suffix}" if not has_images else f"veo_3_1_i2v_s_lite{suffix}{tier_suffix}"
+        else:
+            base = f"veo_3_1_t2v_fast{suffix}{tier_suffix}" if not has_images else f"veo_3_1_i2v_s_fast{suffix}{tier_suffix}"
+        return base
+
     async def generate_video(self, prompt, image_paths=None, model="veo-3.1-fast", aspect_ratio="16:9", duration=8, quality="720p", seed=None):
         self._poll_logged = False
         await self.ensure_token()
         project_id = getattr(self, "_project_id", None) or str(uuid.uuid4())
         self._project_id = project_id
+
         images = []
         for p in image_paths or []:
             images.append(await self.upload_image(p))
-        recaptcha_token = await self.get_recaptcha_token("video_generate")
-        self._last_model_key = model
-        payload = {
-            "clientContext": {"sessionId": self._session_id, "projectId": project_id},
-            "requests": [{
-                "prompt": prompt,
-                "imageInputs": images,
-                "aspectRatio": aspect_ratio,
-                "durationSeconds": int(duration),
-                "quality": quality,
-                "model": model,
-                "seed": seed or int(time.time()),
-                "recaptchaToken": recaptcha_token,
-            }],
+
+        recaptcha_token = await self.get_recaptcha_token("VIDEO_GENERATION")
+
+        ar_enum = self._VIDEO_ASPECT_MAP.get(aspect_ratio, "VIDEO_ASPECT_RATIO_LANDSCAPE")
+        video_model_key = self._resolve_video_model_key(model, aspect_ratio, bool(images))
+        self._last_model_key = video_model_key
+
+        request_item = {
+            "textInput": {"prompt": prompt},
+            "aspectRatio": ar_enum,
+            "videoModelKey": video_model_key,
+            "seed": seed or int(time.time()),
         }
-        url = f"{AISANDBOX_BASE}/video:batchAsyncGenerateVideo"
+        if images:
+            request_item["startImage"] = {"mediaId": images[0]}
+
+        payload = {
+            "clientContext": {
+                "sessionId": self._session_id,
+                "projectId": project_id,
+                "tool": "PINHOLE",
+                "recaptchaContext": {
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                    "token": recaptcha_token,
+                },
+            },
+            "requests": [request_item],
+        }
+
+        if images:
+            url = f"{AISANDBOX_BASE}/video:batchAsyncGenerateVideoStartImage"
+        else:
+            url = f"{AISANDBOX_BASE}/video:batchAsyncGenerateVideo"
+
         result = await self._video_gen_httpx(url, payload)
         return self._extract_generation_id(result, 0) or result
 
@@ -745,14 +790,21 @@ class FlowClient:
     async def extend_video(self, media_id, prompt, quality="720p", aspect_ratio="16:9"):
         await self.ensure_token()
         workflow_id = str(uuid.uuid4())
-        recaptcha_token = await self.get_recaptcha_token("video_extend")
+        recaptcha_token = await self.get_recaptcha_token("VIDEO_GENERATION")
+        ar_enum = self._VIDEO_ASPECT_MAP.get(aspect_ratio, "VIDEO_ASPECT_RATIO_LANDSCAPE")
         payload = {
-            "clientContext": {"sessionId": self._session_id, "workflowId": workflow_id},
-            "mediaId": media_id,
-            "prompt": prompt,
-            "quality": quality,
-            "aspectRatio": aspect_ratio,
-            "recaptchaToken": recaptcha_token,
+            "clientContext": {
+                "sessionId": self._session_id,
+                "workflowId": workflow_id,
+                "tool": "PINHOLE",
+                "recaptchaContext": {
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                    "token": recaptcha_token,
+                },
+            },
+            "videoInput": {"mediaId": media_id},
+            "textInput": {"prompt": prompt},
+            "aspectRatio": ar_enum,
         }
         result = await self._browser_sandbox_request("video:extend", payload)
         return self._extract_generation_id(result, 0) or result
@@ -842,6 +894,17 @@ class FlowClient:
             log.warning(f"Storyboard prompt failed: {e}")
         return additional_input
 
+    _IMAGE_ASPECT_MAP = {
+        "1:1": "IMAGE_ASPECT_RATIO_SQUARE",
+        "square": "IMAGE_ASPECT_RATIO_SQUARE",
+        "16:9": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+        "landscape": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+        "9:16": "IMAGE_ASPECT_RATIO_PORTRAIT",
+        "portrait": "IMAGE_ASPECT_RATIO_PORTRAIT",
+        "4:3": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+        "3:4": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    }
+
     async def _generate_image_whisk(self, prompt, image_paths=None, model="Nano Banana 2", aspect_ratio="1:1"):
         await self.ensure_token()
         project_id = getattr(self, "_project_id", None) or str(uuid.uuid4())
@@ -849,18 +912,30 @@ class FlowClient:
         inputs = []
         for p in image_paths or []:
             if os.path.isfile(p):
-                inputs.append(await self.upload_image(p))
+                media = await self.upload_image(p)
+                media_id = media if isinstance(media, str) else media.get("mediaId", media.get("name", ""))
+                inputs.append({"name": media_id, "imageInputType": "IMAGE_INPUT_TYPE_BASE_IMAGE"})
             else:
                 log.warning(f"Reference image not found: {p}")
-        recaptcha_token = await self.get_recaptcha_token("image_generate")
+        recaptcha_token = await self.get_recaptcha_token("IMAGE_GENERATION")
+        ar_enum = self._IMAGE_ASPECT_MAP.get(aspect_ratio, "IMAGE_ASPECT_RATIO_SQUARE")
         payload = {
-            "clientContext": {"sessionId": self._session_id, "projectId": project_id},
+            "clientContext": {
+                "sessionId": self._session_id,
+                "projectId": project_id,
+                "tool": "PINHOLE",
+                "recaptchaContext": {
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                    "token": recaptcha_token,
+                },
+            },
             "prompt": prompt,
-            "imageInputs": inputs,
-            "model": self._map_image_model(model),
-            "aspectRatio": aspect_ratio,
-            "recaptchaToken": recaptcha_token,
+            "imageAspectRatio": ar_enum,
+            "imageModelName": self._map_image_model(model),
+            "seed": int(time.time()),
         }
+        if inputs:
+            payload["imageInputs"] = inputs
         return await self._browser_sandbox_request(":runImageFx", payload)
 
     async def generate_image(self, prompt, image_paths=None, model="Nano Banana 2", aspect_ratio="1:1"):
@@ -917,18 +992,45 @@ class FlowClient:
         await self.ensure_token()
         res_key = resolution.upper().replace(" ", "")
         target_enum = {"2K": "UPSCALE_2K", "4K": "UPSCALE_4K"}.get(res_key, "UPSCALE_2K")
-        recaptcha_token = await self.get_recaptcha_token("image_upsample")
-        payload = {"mediaId": media_id, "targetResolution": target_enum, "recaptchaToken": recaptcha_token}
+        recaptcha_token = await self.get_recaptcha_token("IMAGE_GENERATION")
+        payload = {
+            "clientContext": {
+                "sessionId": self._session_id,
+                "tool": "PINHOLE",
+                "recaptchaContext": {
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                    "token": recaptcha_token,
+                },
+            },
+            "mediaId": media_id,
+            "targetResolution": target_enum,
+        }
         return await self._browser_sandbox_request("image:upscale", payload)
+
+    _VIDEO_RESOLUTION_MAP = {
+        "1080p": "VIDEO_RESOLUTION_1080P",
+        "4k": "VIDEO_RESOLUTION_4K",
+        "720p": "VIDEO_RESOLUTION_720P",
+    }
 
     async def upsample_video(self, media_id, output_path=None, resolution="1080p"):
         await self.ensure_token()
-        recaptcha_token = await self.get_recaptcha_token("video_upsample")
+        recaptcha_token = await self.get_recaptcha_token("VIDEO_GENERATION")
+        res_enum = self._VIDEO_RESOLUTION_MAP.get(resolution.lower(), "VIDEO_RESOLUTION_1080P")
+        video_model_key = "veo_3_1_upsampler_4k" if "4k" in resolution.lower() else "veo_3_1_upsampler_1080p"
         payload = {
-            "mediaId": media_id,
-            "targetResolution": resolution.upper().replace("P", "p"),
-            "sessionId": self._session_id,
-            "recaptchaToken": recaptcha_token,
+            "clientContext": {
+                "sessionId": self._session_id,
+                "tool": "PINHOLE",
+                "recaptchaContext": {
+                    "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+                    "token": recaptcha_token,
+                },
+            },
+            "videoInput": {"mediaId": media_id},
+            "resolution": res_enum,
+            "videoModelKey": video_model_key,
+            "seed": int(time.time()),
         }
         result = await self._browser_sandbox_request("video:upscale", payload)
         out_id = self._extract_generation_id(result, 0) or media_id

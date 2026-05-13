@@ -22,7 +22,7 @@ from typing import Optional
 
 from playwright.async_api import async_playwright, Playwright, Browser, BrowserContext, Page
 from utils.logger import log
-from utils.platform import find_chrome, get_subprocess_flags, hide_window
+from utils.platform import find_chrome, get_subprocess_kwargs, hide_window
 
 
 _ANTI_DETECT_JS = """
@@ -105,7 +105,7 @@ class SubprocessTokenProvider:
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            **get_subprocess_flags(),
+            **get_subprocess_kwargs(),
         )
 
         cdp_url = f'http://127.0.0.1:{_CDP_PORT}'
