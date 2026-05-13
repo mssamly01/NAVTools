@@ -141,79 +141,163 @@ class FlowClient:
         return result.get("accessToken") or result.get("access_token") or None
 
     async def _trigger_nextauth_signin(self) -> str | None:
-        """Trigger NextAuth Google sign-in via browser navigation.
+        """Trigger Google sign-in for labs.google via multiple strategies.
 
-        Uses page.goto() to navigate through the OAuth flow instead of
-        fetch() which can be blocked by CSP or CORS policies.
-
-        Flow:
-          1. Navigate to /api/auth/signin/google → triggers OAuth redirect
-          2. Google auto-approves (cookies present) → redirect back
-          3. NextAuth sets session cookie
-          4. Navigate to /fx → fetch session → accessToken
+        Strategy 1: Google ServiceLogin with continue param (most reliable)
+        Strategy 2: Direct NextAuth signin endpoint navigation
+        Strategy 3: Click sign-in button on the page
         """
-        try:
-            # Navigate directly to the NextAuth Google sign-in endpoint
-            # This triggers the full OAuth redirect chain through the browser
-            signin_url = "https://labs.google/fx/api/auth/signin/google?callbackUrl=https%3A%2F%2Flabs.google%2Ffx"
-            log.info(f"Navigating to NextAuth sign-in endpoint...")
+        strategies = [
+            self._strategy_service_login,
+            self._strategy_nextauth_endpoint,
+            self._strategy_page_signin_button,
+        ]
+        for strategy in strategies:
+            try:
+                token = await strategy()
+                if token:
+                    return token
+            except Exception as e:
+                log.debug(f"Strategy {strategy.__name__} failed: {e}")
+        return None
 
-            response = await self._page.goto(signin_url, wait_until="domcontentloaded", timeout=30000)
+    async def _strategy_service_login(self) -> str | None:
+        """Navigate through Google ServiceLogin with continue=labs.google/fx.
 
-            # After goto, the page might be at:
-            # a) Google OAuth consent (if cookies don't auto-approve)
-            # b) labs.google/fx (if OAuth auto-approved and redirected back)
-            # c) Still on accounts.google.com (choosing account)
+        When Google cookies are present, ServiceLogin auto-redirects to the
+        continue URL with proper auth context, which establishes the session.
+        """
+        log.info("Trying Google ServiceLogin with continue param...")
+        login_url = (
+            "https://accounts.google.com/ServiceLogin"
+            "?continue=https%3A%2F%2Flabs.google%2Ffx"
+            "&service=labs"
+        )
+        await self._page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
 
-            # Wait for redirect chain to settle
-            for _ in range(15):
-                await asyncio.sleep(1)
-                current_url = self._page.url or ""
-                if "labs.google" in current_url:
-                    break
-                # If stuck on Google account chooser, try clicking the account
-                if "accounts.google.com" in current_url:
-                    try:
-                        # Try to click the first account in the chooser
-                        account_btn = await self._page.query_selector(
-                            'div[data-email], li[data-email], '
-                            'div[data-identifier], div.JDAKTe'
-                        )
-                        if account_btn and await account_btn.is_visible():
-                            log.info("Clicking account in Google chooser...")
-                            await account_btn.click()
-                            await asyncio.sleep(3)
-                    except Exception:
-                        pass
-
-            # Check if we made it back to labs.google
+        # Wait for redirect chain: Google → labs.google
+        for i in range(20):
+            await asyncio.sleep(1)
             current_url = self._page.url or ""
-            if "labs.google" not in current_url:
-                log.warning(f"OAuth redirect did not return to labs.google. Current: {current_url}")
-                # Force navigate back
-                await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
-                await asyncio.sleep(2)
+            if "labs.google" in current_url and "accounts.google" not in current_url:
+                log.info(f"ServiceLogin redirect complete: {current_url[:80]}")
+                break
+            # Handle account chooser
+            if "accounts.google.com" in current_url and i > 3:
+                try:
+                    account_el = await self._page.query_selector(
+                        'div[data-email], li[data-email], div[data-identifier], '
+                        'div.JDAKTe, a[data-email]'
+                    )
+                    if account_el and await account_el.is_visible():
+                        log.info("Clicking account in chooser...")
+                        await account_el.click()
+                        await asyncio.sleep(3)
+                except Exception:
+                    pass
 
-            # Now try fetching the session
-            result = await self._fetch_session()
-            token = self._extract_token(result)
-            if token:
-                log.info("NextAuth sign-in successful, got access token")
-                return token
+        # Ensure we're on labs.google
+        if "labs.google" not in (self._page.url or ""):
+            await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
 
-            # Second attempt: wait a bit longer for session to be established
-            await asyncio.sleep(3)
-            result = await self._fetch_session()
-            token = self._extract_token(result)
-            if token:
-                log.info("NextAuth sign-in successful (delayed), got access token")
-                return token
+        # Wait for page scripts to establish session
+        await asyncio.sleep(3)
+        result = await self._fetch_session()
+        token = self._extract_token(result)
+        if token:
+            log.info("ServiceLogin strategy successful")
+            return token
+        return None
 
-            log.warning(f"NextAuth sign-in completed but session still empty: {result}")
-            return None
-        except Exception as e:
-            log.error(f"NextAuth sign-in flow failed: {e}")
-            return None
+    async def _strategy_nextauth_endpoint(self) -> str | None:
+        """Navigate to NextAuth signin endpoint directly."""
+        log.info("Trying NextAuth signin endpoint...")
+        signin_url = "https://labs.google/fx/api/auth/signin/google?callbackUrl=https%3A%2F%2Flabs.google%2Ffx"
+        await self._page.goto(signin_url, wait_until="domcontentloaded", timeout=30000)
+
+        for _ in range(15):
+            await asyncio.sleep(1)
+            current_url = self._page.url or ""
+            if "labs.google" in current_url and "/api/auth/" not in current_url:
+                break
+            if "accounts.google.com" in current_url:
+                try:
+                    el = await self._page.query_selector(
+                        'div[data-email], li[data-email], div.JDAKTe'
+                    )
+                    if el and await el.is_visible():
+                        await el.click()
+                        await asyncio.sleep(3)
+                except Exception:
+                    pass
+
+        if "labs.google" not in (self._page.url or ""):
+            await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
+
+        await asyncio.sleep(2)
+        result = await self._fetch_session()
+        token = self._extract_token(result)
+        if token:
+            log.info("NextAuth endpoint strategy successful")
+            return token
+        return None
+
+    async def _strategy_page_signin_button(self) -> str | None:
+        """Navigate to labs.google/fx and look for sign-in UI elements."""
+        log.info("Trying page sign-in button strategy...")
+        if "labs.google" not in (self._page.url or ""):
+            await self._page.goto("https://labs.google/fx", wait_until="networkidle", timeout=30000)
+        else:
+            await self._page.reload(wait_until="networkidle", timeout=30000)
+
+        await asyncio.sleep(3)
+
+        # Look for various sign-in patterns
+        selectors = [
+            'button:has-text("Sign in")',
+            'a:has-text("Sign in")',
+            'button:has-text("Đăng nhập")',
+            'a[href*="accounts.google.com/signin"]',
+            'a[href*="accounts.google.com/ServiceLogin"]',
+            '[data-action="sign-in"]',
+            '.sign-in-button',
+            'button[aria-label*="Sign in"]',
+        ]
+        for selector in selectors:
+            try:
+                btn = await self._page.query_selector(selector)
+                if btn and await btn.is_visible():
+                    log.info(f"Found sign-in element: {selector}")
+                    # Try popup flow
+                    try:
+                        async with self._page.context.expect_page(timeout=5000) as pi:
+                            await btn.click()
+                        popup = await pi.value
+                        await popup.wait_for_event("close", timeout=30000)
+                    except Exception:
+                        # No popup — might be a regular navigation
+                        await btn.click()
+                    await asyncio.sleep(3)
+
+                    # Check if redirected to Google, wait for return
+                    for _ in range(15):
+                        if "labs.google" in (self._page.url or ""):
+                            break
+                        await asyncio.sleep(1)
+
+                    if "labs.google" not in (self._page.url or ""):
+                        await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
+
+                    await asyncio.sleep(2)
+                    result = await self._fetch_session()
+                    token = self._extract_token(result)
+                    if token:
+                        log.info("Page sign-in button strategy successful")
+                        return token
+            except Exception:
+                continue
+        return None
 
     def set_recaptcha_provider(self, provider):
         """Set external reCAPTCHA token provider (SubprocessTokenProvider)."""
