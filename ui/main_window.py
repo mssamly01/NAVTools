@@ -269,7 +269,7 @@ class MainWindow(QMainWindow):
         try:
             from ui.dialogs.settings_dialog import SettingsDialog
 
-            dlg = SettingsDialog(self.db, self.settings, self)
+            dlg = SettingsDialog(self.db, self.settings, self.browser_manager, self)
             dlg.exec()
             self._refresh_account_headers()
         except Exception as e:

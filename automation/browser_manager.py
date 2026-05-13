@@ -108,6 +108,16 @@ class BrowserManager:
                     log.warning(f"Failed to load cookies: {e}")
 
         if not cookies:
+            log.info(f"Cookies JSON missing for {email}, attempting force export...")
+            if await self.force_export_cookies(cookie_path):
+                if cookies_file.exists():
+                    try:
+                        with open(cookies_file, "r", encoding="utf-8") as f:
+                            cookies = _json.load(f)
+                        log.info(f"Recovered {len(cookies)} cookies via force export")
+                    except Exception: pass
+
+        if not cookies:
             raise RuntimeError(f"No cookies for {email}. Please login/renew account first.")
 
         self._profiles[account_id] = cookie_path or ""
@@ -138,7 +148,10 @@ class BrowserManager:
         )
         self._browsers[account_id] = browser
 
-        context = await browser.new_context()
+        temp_page = await browser.new_page()
+        ua = await temp_page.evaluate("navigator.userAgent")
+        await temp_page.close()
+        context = await browser.new_context(user_agent=ua)
         await context.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -339,3 +352,48 @@ class BrowserManager:
     @property
     def active_count(self) -> int:
         return len(self._browsers)
+
+    async def force_export_cookies(self, profile_dir: str):
+        """Use Playwright to open the profile and export cookies to JSON."""
+        prof_path = Path(profile_dir)
+        if not prof_path.exists():
+            return False
+            
+        cookies_file = prof_path / "cookies_export.json"
+        log.info(f"Forcing cookie export for profile: {profile_dir}")
+        
+        # Cleanup locks if any
+        for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            lock_file = prof_path / lock_name
+            if lock_file.exists():
+                try: lock_file.unlink()
+                except Exception: pass
+
+        pw = None
+        browser = None
+        try:
+            pw = await async_playwright().start()
+            # Launch persistent context to access the SQLite DB via Playwright
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir=str(prof_path),
+                headless=True,
+                args=["--disable-gpu", "--no-sandbox"]
+            )
+            cookies = await context.cookies()
+            import json
+            cookies_data = [
+                {k: v for k, v in c.items() if k in ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")}
+                for c in cookies
+            ]
+            with open(cookies_file, "w", encoding="utf-8") as f:
+                json.dump(cookies_data, f)
+            log.info(f"Successfully exported {len(cookies_data)} cookies to {cookies_file}")
+            await context.close()
+            return True
+        except Exception as e:
+            log.warning(f"Force cookie export failed: {e}")
+            return False
+        finally:
+            if pw:
+                try: await pw.stop()
+                except Exception: pass

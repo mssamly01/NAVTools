@@ -109,7 +109,7 @@ class SubprocessTokenProvider:
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            **get_subprocess_flags(),
+            creationflags=get_subprocess_flags(),
         )
 
         cdp_url = f'http://127.0.0.1:{_CDP_PORT}'

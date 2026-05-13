@@ -257,12 +257,15 @@ def main():
         log.warning(f"Splash not shown: {e}")
 
     from ui.main_window import MainWindow
+    from automation.browser_manager import BrowserManager
+
+    browser_manager = BrowserManager()
 
     try:
         if splash:
             splash.set_progress(40, "Tải các trang chính...")
 
-        window = MainWindow(db=db, settings=settings)
+        window = MainWindow(db=db, settings=settings, browser_manager=browser_manager)
         window.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {current_user}")
 
         if splash:
@@ -301,6 +304,14 @@ def main():
 
     _watchdog_heartbeat["t"] = _time.time()
     exit_code = app.exec()
+    
+    # Final cleanup
+    try:
+        import asyncio
+        asyncio.run(browser_manager.stop())
+    except Exception:
+        pass
+        
     db.close()
     log.info("Application closed")
     sys.exit(exit_code)

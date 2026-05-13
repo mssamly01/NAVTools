@@ -62,23 +62,33 @@ def _read_chrome_cookies(profile_dir: Path):
             log.warning(f"Could not read {prefs_file}: {e}")
 
     cookies_db = profile_dir / "Default" / "Network" / "Cookies"
-    tmp_db = profile_dir / "cookies_copy.db"
+    if not cookies_db.exists():
+        cookies_db = profile_dir / "Default" / "Cookies"  # Older Chrome versions
+
+    tmp_db = profile_dir / f"cookies_copy_{id(profile_dir)}.db"
     if cookies_db.exists():
-        try:
-            shutil.copy2(cookies_db, tmp_db)
-            conn = sqlite3.connect(str(tmp_db))
-            row = conn.execute("SELECT MAX(expires_utc) FROM cookies WHERE host_key LIKE '%google.com%'").fetchone()
-            conn.close()
-            if row and row[0]:
-                chrome_epoch = datetime(1601, 1, 1)
-                info["cookie_exp"] = chrome_epoch + timedelta(microseconds=int(row[0]))
-        except Exception as e:
-            log.warning(f"Could not read Cookies DB: {e}")
-        finally:
+        for attempt in range(5):
             try:
-                os.remove(tmp_db)
-            except Exception:
-                pass
+                # Use shutil.copy instead of copy2 to avoid metadata lock issues
+                shutil.copy(cookies_db, tmp_db)
+                conn = sqlite3.connect(str(tmp_db))
+                # Google cookies often have 'google.com' in host_key
+                row = conn.execute("SELECT MAX(expires_utc) FROM cookies WHERE host_key LIKE '%google.com%'").fetchone()
+                conn.close()
+                if row and row[0]:
+                    chrome_epoch = datetime(1601, 1, 1)
+                    info["cookie_exp"] = chrome_epoch + timedelta(microseconds=int(row[0]))
+                break # Success
+            except Exception as e:
+                if attempt == 4:
+                    log.warning(f"Could not read Cookies DB after 5 attempts: {e}")
+                time.sleep(1)
+            finally:
+                try:
+                    if tmp_db.exists():
+                        os.remove(tmp_db)
+                except Exception:
+                    pass
     return info
 
 
@@ -98,13 +108,24 @@ class _RenewSignals(QObject):
 class SettingsDialog(QDialog):
     """Settings and account management dialog."""
 
-    def __init__(self, db: Database, settings: Settings | None = None, parent=None):
+    def __init__(self, db: Database, settings: Settings | None = None, browser_mgr=None, parent=None):
         super().__init__(parent)
         self.db = db
         self.settings = settings or Settings(db)
+        self.browser_mgr = browser_mgr
         self.accounts: list[Account] = []
         self._login_thread = None
         self._renew_thread = None
+
+        self.login_signals = _LoginSignals()
+        self.login_signals.success.connect(self._on_login_success)
+        self.login_signals.failed.connect(self._on_login_failed)
+        self.login_signals.finished.connect(self._on_login_finished)
+
+        self.renew_signals = _RenewSignals()
+        self.renew_signals.success.connect(self._on_renew_success)
+        self.renew_signals.failed.connect(self._on_renew_failed)
+        self.renew_signals.finished.connect(self._on_renew_finished)
         self.setWindowTitle(f"{APP_NAME} — Cài đặt hệ thống")
         self.setMinimumSize(950, 550)
         self.setModal(True)
@@ -144,9 +165,13 @@ class SettingsDialog(QDialog):
 
         self.accounts_table = QTableWidget(0, 7)
         self.accounts_table.setHorizontalHeaderLabels(["Email", "Gói", "Credit", "Cookie Exp", "Bật", "Gemini Key", "Thao tác"])
-        self.accounts_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.accounts_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.accounts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.accounts_table.horizontalHeader().setMinimumSectionSize(80)
+        self.accounts_table.setColumnWidth(6, 220)
         self.accounts_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.accounts_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.accounts_table.verticalHeader().setDefaultSectionSize(50)
         layout.addWidget(self.accounts_table)
         tabs.addTab(tab, "🌐 Tài khoản Google")
 
@@ -230,10 +255,20 @@ class SettingsDialog(QDialog):
     def _make_action_buttons(self, account):
         box = QWidget()
         layout = QHBoxLayout(box)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(5, 2, 5, 2)
+        layout.setSpacing(5)
         renew = QPushButton("Gia hạn")
+        renew.setObjectName("btn-secondary")
         edit = QPushButton("Sửa")
+        edit.setObjectName("btn-secondary")
         delete = QPushButton("Xóa")
+        delete.setObjectName("btn-danger")
+        
+        for btn in (renew, edit, delete):
+            btn.setMinimumHeight(30)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet("padding: 2px 10px; min-width: 60px;")
+
         renew.clicked.connect(lambda _, a=account: self._renew_session(a))
         edit.clicked.connect(lambda _, a=account: self._edit_account(a))
         delete.clicked.connect(lambda _, a=account: self._delete_account(a))
@@ -264,7 +299,7 @@ class SettingsDialog(QDialog):
         enabled.toggled.connect(lambda checked, a=account: self._toggle_account(a, checked))
         self.accounts_table.setCellWidget(row, 4, self._center(enabled))
         self.accounts_table.setItem(row, 5, QTableWidgetItem("Yes" if account.gemini_api_key else ""))
-        self.accounts_table.setCellWidget(row, 6, self._make_action_buttons(account))
+        self.accounts_table.setCellWidget(row, 6, self._center(self._make_action_buttons(account)))
 
     def _center(self, widget):
         box = QWidget()
@@ -285,23 +320,30 @@ class SettingsDialog(QDialog):
         if not chrome:
             QMessageBox.warning(self, "Không tìm thấy Chrome", "Đăng nhập Google cần Chrome.")
             return
-        BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen([chrome, f"--user-data-dir={BROWSER_PROFILE_DIR}", "https://accounts.google.com/"], cwd=str(BASE_DIR))
-        self._monitor_login_and_fetch()
+        
+        import uuid
+        temp_id = str(uuid.uuid4())[:8]
+        profile_path = BROWSER_PROFILE_DIR / f"temp_{temp_id}"
+        profile_path.mkdir(parents=True, exist_ok=True)
+        
+        subprocess.Popen([chrome, f"--user-data-dir={profile_path}", "https://accounts.google.com/"], cwd=str(BASE_DIR))
+        self._monitor_login_and_fetch(profile_path)
 
-    def _monitor_login_and_fetch(self):
-        thread = threading.Thread(target=lambda: asyncio.run(self._async_monitor_login()), daemon=True)
+    def _monitor_login_and_fetch(self, profile_path):
+        thread = threading.Thread(target=lambda: asyncio.run(self._async_monitor_login(profile_path)), daemon=True)
         thread.start()
         self._login_thread = thread
 
-    async def _async_monitor_login(self):
+    async def _async_monitor_login(self, profile_path):
         for _ in range(180):
-            info = _read_chrome_cookies(Path(BROWSER_PROFILE_DIR))
+            info = _read_chrome_cookies(Path(profile_path))
             if info.get("email"):
-                self._on_login_success(info["email"], str(BROWSER_PROFILE_DIR), info.get("cookie_exp"), None, None)
+                self.login_signals.success.emit(info["email"], str(profile_path), info.get("cookie_exp"), None, None)
+                self.login_signals.finished.emit()
                 return
             await asyncio.sleep(1)
-        self._on_login_failed("Đăng nhập quá thời gian chờ.")
+        self.login_signals.failed.emit("Đăng nhập quá thời gian chờ.")
+        self.login_signals.finished.emit()
 
     def _on_login_success(self, email, cookie_path, cookie_exp=None, token_exp=None, gemini_api_key=None):
         account = None
@@ -311,11 +353,26 @@ class SettingsDialog(QDialog):
                 break
         if account is None:
             account = self.db.add_account(email)
+        
+        # Move temp profile to permanent profile based on email
+        safe_email = email.replace("@", "_").replace(".", "_")
+        permanent_path = BROWSER_PROFILE_DIR / safe_email
+        if Path(cookie_path).exists() and str(cookie_path) != str(permanent_path):
+            if permanent_path.exists():
+                try: shutil.rmtree(permanent_path)
+                except Exception: pass
+            try:
+                shutil.move(cookie_path, permanent_path)
+                cookie_path = str(permanent_path)
+            except Exception: pass
+
         account.cookie_path = cookie_path
         account.cookie_exp = cookie_exp
         account.token_exp = token_exp
         account.gemini_api_key = gemini_api_key or account.gemini_api_key
         self.db.update_account(account)
+        if self.browser_mgr and account.cookie_path:
+            threading.Thread(target=lambda: asyncio.run(self.browser_mgr.force_export_cookies(account.cookie_path)), daemon=True).start()
         self._load_accounts()
         QMessageBox.information(self, "Đã lưu đăng nhập", f"Đã lưu tài khoản: {email}")
 
@@ -331,6 +388,10 @@ class SettingsDialog(QDialog):
     def _renew_session(self, account):
         if not account:
             return
+        chrome = find_chrome()
+        if chrome and account.cookie_path:
+            subprocess.Popen([chrome, f"--user-data-dir={account.cookie_path}", "https://accounts.google.com/"], cwd=str(BASE_DIR))
+        
         thread = threading.Thread(target=lambda: self._run_renew(account.id, account.email, account.cookie_path, None), daemon=True)
         thread.start()
         self._renew_thread = thread
@@ -339,7 +400,8 @@ class SettingsDialog(QDialog):
         try:
             asyncio.run(self._async_renew(account_id, email, cookie_path, progress))
         except Exception as e:
-            self._on_renew_failed(account_id, str(e))
+            self.renew_signals.failed.emit(account_id, str(e))
+            self.renew_signals.finished.emit()
 
     def _cleanup_renew_chrome(self, profile_dir):
         return None
@@ -347,7 +409,8 @@ class SettingsDialog(QDialog):
     async def _async_renew(self, account_id, email, cookie_path, progress=None):
         await asyncio.sleep(0.5)
         info = _read_chrome_cookies(Path(cookie_path or BROWSER_PROFILE_DIR))
-        self._on_renew_success(account_id, info.get("cookie_exp"), None, info.get("email") or email)
+        self.renew_signals.success.emit(account_id, info.get("cookie_exp"), None, info.get("email") or email)
+        self.renew_signals.finished.emit()
 
     def _on_renew_success(self, account_id, cookie_exp=None, token_exp=None, email=None):
         account = self.db.get_account(account_id)
@@ -356,6 +419,8 @@ class SettingsDialog(QDialog):
             account.token_exp = token_exp or account.token_exp
             account.email = email or account.email
             self.db.update_account(account)
+            if self.browser_mgr and account.cookie_path:
+                threading.Thread(target=lambda: asyncio.run(self.browser_mgr.force_export_cookies(account.cookie_path)), daemon=True).start()
         self._load_accounts()
 
     def _on_renew_failed(self, account_id, message):
