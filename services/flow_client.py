@@ -155,17 +155,39 @@ class FlowClient:
             return
 
         log.info(f"On Google account picker: {current_url[:80]}")
-        # Try clicking the account email
-        try:
-            account_el = await self._page.wait_for_selector(
-                '[data-email], .JDAKTe, div[role="link"]',
-                timeout=10000,
-            )
-            if account_el:
-                await account_el.click()
-                log.info("Clicked account, waiting for redirect back...")
-        except Exception:
-            pass
+
+        # Try clicking the specific account email matching our account
+        selectors = [
+            f'[data-email="{self._account_email}"]',
+            '[data-email]',
+            '.JDAKTe',
+            'div[role="link"]',
+            'li[data-identifier]',
+        ]
+        clicked = False
+        for sel in selectors:
+            try:
+                el = await self._page.wait_for_selector(sel, timeout=5000)
+                if el:
+                    await el.click()
+                    log.info(f"Clicked account selector: {sel}")
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            # Try clicking any visible "Continue" / "Next" button
+            for btn_sel in ['button:has-text("Continue")', 'button:has-text("Next")',
+                            'button:has-text("Tiếp tục")', '#identifierNext']:
+                try:
+                    btn = await self._page.query_selector(btn_sel)
+                    if btn and await btn.is_visible():
+                        await btn.click()
+                        log.info(f"Clicked: {btn_sel}")
+                        break
+                except Exception:
+                    continue
 
         # Wait for redirect back to labs.google
         try:
@@ -197,16 +219,58 @@ class FlowClient:
             csrf_token = (csrf_result or {}).get("csrfToken")
 
             if csrf_token:
-                log.info(f"Got CSRF token, initiating Google sign-in...")
-                # Navigate to the NextAuth sign-in page for Google provider
+                log.info("Got CSRF token, initiating Google sign-in...")
+                # Try server-side CSRF POST first (faster, no page navigation)
+                try:
+                    post_result = await self._page.evaluate("""async (csrf) => {
+                        const r = await fetch('/fx/api/auth/signin/google', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                            body: 'csrfToken=' + encodeURIComponent(csrf) + '&callbackUrl=' + encodeURIComponent(window.location.href),
+                            credentials: 'include',
+                            redirect: 'follow'
+                        });
+                        return {status: r.status, url: r.url, ok: r.ok};
+                    }""", csrf_token)
+                    log.info(f"CSRF POST result: {post_result}")
+                except Exception as e:
+                    log.debug(f"CSRF POST failed: {e}")
+
+                # Navigate to NextAuth sign-in page for Google provider
                 signin_url = "https://labs.google/fx/api/auth/signin/google"
                 await self._page.goto(signin_url, wait_until="load", timeout=30000)
                 await asyncio.sleep(2)
 
-                # This should redirect to Google OAuth. Since we have Google
-                # cookies in the persistent context, it may auto-complete.
+                # The signin page shows "Sign in with Google" button — click it
+                current = self._page.url or ""
+                if "signin" in current and "labs.google" in current:
+                    for btn_sel in [
+                        'button:has-text("Sign in with Google")',
+                        'button:has-text("Sign in")',
+                        'button:has-text("Đăng nhập bằng Google")',
+                        'button:has-text("Đăng nhập")',
+                        'div[role="button"]',
+                    ]:
+                        try:
+                            btn = await self._page.query_selector(btn_sel)
+                            if btn and await btn.is_visible():
+                                log.info(f"Clicking sign-in button: {btn_sel}")
+                                await btn.click(force=True)
+                                await asyncio.sleep(3)
+                                break
+                        except Exception:
+                            continue
+
+                # Handle Google account picker if redirected there
                 await self._handle_google_account_picker()
                 await asyncio.sleep(2)
+
+                # Wait for redirect back to labs.google (up to 15s)
+                for _ in range(15):
+                    cur = self._page.url or ""
+                    if "labs.google" in cur and "signin" not in cur:
+                        break
+                    await asyncio.sleep(1)
 
                 # Check if we're back on labs.google
                 if "labs.google" in (self._page.url or ""):
