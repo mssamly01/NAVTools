@@ -130,6 +130,11 @@ class TaskWorker(QThread):
                     await self.browser_manager.close_context(account.id)
                 except Exception:
                     pass
+            if hasattr(self, '_recaptcha_provider') and self._recaptcha_provider:
+                try:
+                    await self._recaptcha_provider.stop()
+                except Exception:
+                    pass
 
         self.signals.task_completed.emit(task_id)
 
@@ -156,6 +161,17 @@ class TaskWorker(QThread):
             return
 
         client = FlowClient(page, cookie_path=account.cookie_path, account_email=account.email)
+
+        # Set up reCAPTCHA token provider for this client
+        try:
+            from automation.recaptcha_provider import SubprocessTokenProvider
+            cookies = await page.context.cookies()
+            self._recaptcha_provider = SubprocessTokenProvider()
+            await self._recaptcha_provider.start(cookies)
+            client.set_recaptcha_provider(self._recaptcha_provider)
+            log.info("SubprocessTokenProvider initialized for FlowClient")
+        except Exception as e:
+            log.warning(f"SubprocessTokenProvider setup failed (will use fallback): {e}")
 
         config = task if isinstance(task, dict) else {}
         aspect_ratio = config.get("aspect_ratio", "16:9")

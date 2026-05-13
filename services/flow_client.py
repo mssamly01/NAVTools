@@ -422,11 +422,41 @@ class FlowClient:
                     self._recaptcha_fail_count += 1
                     log.warning(f"reCAPTCHA provider failed: {e}")
 
+            # Wait for grecaptcha to load on the page
+            for _wait in range(20):
+                loaded = await self._page.evaluate(
+                    "typeof grecaptcha !== 'undefined' && "
+                    "!!(grecaptcha.enterprise || grecaptcha.execute)"
+                )
+                if loaded:
+                    break
+                await asyncio.sleep(0.5)
+
             result = await self._page.evaluate(
                 """async (action) => {
-                    if (!window.grecaptcha || !grecaptcha.enterprise) return {error: "grecaptcha missing"};
-                    const token = await grecaptcha.enterprise.execute(undefined, {action});
-                    return {token};
+                    try {
+                        let siteKey = null;
+                        const scripts = document.querySelectorAll('script[src*="recaptcha"]');
+                        for (const s of scripts) {
+                            const m = s.src.match(/[?&]render=([^&]+)/);
+                            if (m) { siteKey = m[1]; break; }
+                        }
+                        if (!siteKey) return {error: 'no_site_key'};
+                        if (typeof grecaptcha === 'undefined') return {error: 'grecaptcha_not_loaded'};
+                        if (grecaptcha.enterprise) {
+                            const token = await grecaptcha.enterprise.execute(siteKey, {action});
+                            if (token) return {token, key: siteKey};
+                            return {error: 'empty_token_enterprise'};
+                        }
+                        if (grecaptcha.execute) {
+                            const token = await grecaptcha.execute(siteKey, {action});
+                            if (token) return {token, key: siteKey};
+                            return {error: 'empty_token_v2'};
+                        }
+                        return {error: 'grecaptcha_api_unavailable'};
+                    } catch(e) {
+                        return {error: e.message || String(e)};
+                    }
                 }""",
                 action,
             )
