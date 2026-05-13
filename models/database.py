@@ -87,6 +87,24 @@ class Database:
         rows = self._conn.execute(sql).fetchall()
         return [Account.from_row(r) for r in rows]
 
+    def get_account(self, account_id: int) -> Optional[Account]:
+        row = self._conn.execute(
+            "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        return Account.from_row(row) if row else None
+
+    def add_account(self, email: str) -> Account:
+        """Create a new account with default values."""
+        account = Account(email=email)
+        self.update_account(account)
+        # Fetch back to get the autoincremented ID
+        row = self._conn.execute(
+            "SELECT id, email, proxy, cookie_path, cookie_exp, tier, credit, enabled, gemini_api_key FROM accounts WHERE email = ? ORDER BY id DESC LIMIT 1",
+            (email,),
+        ).fetchone()
+        return Account.from_row(row)
+
     def update_account(self, account: Account):
         cookie_exp_str = account.cookie_exp.isoformat() if account.cookie_exp else None
         self._conn.execute(
