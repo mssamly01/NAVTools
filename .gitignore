@@ -44,7 +44,10 @@ Thumbs.db
 image_output/
 video_output/
 ffmpeg/
-models/
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.bin
 assets/
 *.mp4
 *.mkv
