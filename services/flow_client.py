@@ -93,8 +93,66 @@ class FlowClient:
             log.debug(f"Session fetch error: {e}")
         return None
 
+    async def _dismiss_overlays(self):
+        """Dismiss cookie consent, terms dialogs, or other overlays on labs.google."""
+        overlay_buttons = [
+            'button:has-text("Accept all")',
+            'button:has-text("Accept")',
+            'button:has-text("I agree")',
+            'button:has-text("Agree")',
+            'button:has-text("OK")',
+            'button:has-text("Got it")',
+            'button:has-text("Đồng ý")',
+            'button:has-text("Chấp nhận")',
+            'button:has-text("Dismiss")',
+            'button:has-text("Close")',
+            '[aria-label="Close"]',
+            '[aria-label="Dismiss"]',
+        ]
+        dismissed = False
+        for sel in overlay_buttons:
+            try:
+                el = await self._page.query_selector(sel)
+                if el and await el.is_visible():
+                    await el.click(force=True)
+                    log.info(f"Dismissed overlay: {sel}")
+                    dismissed = True
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
+
+        # Also try removing blocking overlays via JS
+        try:
+            removed = await self._page.evaluate("""() => {
+                let removed = 0;
+                document.querySelectorAll('[data-state="open"][aria-hidden="true"]').forEach(el => {
+                    el.style.display = 'none';
+                    el.style.pointerEvents = 'none';
+                    removed++;
+                });
+                // Also hide any fixed/absolute overlays blocking clicks
+                document.querySelectorAll('div[class*="overlay"], div[class*="modal"], div[class*="backdrop"]').forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.position === 'fixed' || style.position === 'absolute') {
+                        el.style.display = 'none';
+                        removed++;
+                    }
+                });
+                return removed;
+            }""")
+            if removed:
+                log.info(f"Removed {removed} blocking overlay(s) via JS")
+                dismissed = True
+        except Exception:
+            pass
+
+        return dismissed
+
     async def _try_sign_in(self):
         """Attempt Google sign-in on labs.google via popup or redirect."""
+        # Dismiss any overlays (cookie consent, terms, etc.) first
+        await self._dismiss_overlays()
+
         selectors = [
             'a[href*="accounts.google.com"]',
             'button:has-text("Sign in")',
@@ -123,7 +181,7 @@ class FlowClient:
         try:
             log.info("Attempting sign-in via popup...")
             async with self._page.context.expect_page(timeout=5000) as page_info:
-                await btn.click()
+                await btn.click(force=True)
             popup = await page_info.value
             log.info(f"Popup opened: {popup.url[:80]}")
             # Google cookies should auto-complete the OAuth flow
@@ -152,9 +210,9 @@ class FlowClient:
         except Exception as e:
             log.info(f"Popup flow failed ({e}), trying redirect...")
 
-        # Try 2: redirect flow (page navigates to Google sign-in)
+        # Try 2: redirect flow — use force=True to bypass overlays
         try:
-            await btn.click()
+            await btn.click(force=True)
             await asyncio.sleep(2)
 
             current_url = self._page.url
@@ -183,6 +241,47 @@ class FlowClient:
             return True
         except Exception as e:
             log.warning(f"Redirect sign-in failed: {e}")
+
+        # Try 3: use JavaScript to click the sign-in link directly
+        try:
+            log.info("Trying JS click on sign-in link...")
+            clicked = await self._page.evaluate("""() => {
+                const links = [...document.querySelectorAll('a[href*="accounts.google.com"]')];
+                if (links.length > 0) {
+                    links[0].click();
+                    return true;
+                }
+                const buttons = [...document.querySelectorAll('button')].filter(
+                    b => b.textContent.includes('Sign in') || b.textContent.includes('Đăng nhập')
+                );
+                if (buttons.length > 0) {
+                    buttons[0].click();
+                    return true;
+                }
+                return false;
+            }""")
+            if clicked:
+                log.info("JS click succeeded, waiting for navigation...")
+                await asyncio.sleep(3)
+
+                if "accounts.google.com" in (self._page.url or ""):
+                    try:
+                        account_el = await self._page.wait_for_selector(
+                            '[data-email], .JDAKTe, div[role="link"]',
+                            timeout=10000,
+                        )
+                        if account_el:
+                            await account_el.click()
+                    except Exception:
+                        pass
+                    try:
+                        await self._page.wait_for_url("**/labs.google/**", timeout=30000)
+                    except Exception:
+                        pass
+                await asyncio.sleep(3)
+                return True
+        except Exception as e:
+            log.warning(f"JS sign-in failed: {e}")
 
         return False
 
