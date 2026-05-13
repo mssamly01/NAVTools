@@ -61,9 +61,15 @@ class FlowClient:
         "Imagen 4 Ultra": "IMAGEN_4_ULTRA",
     }
 
+    # Auth modes
+    AUTH_BEARER = "bearer"       # ya29.* from NextAuth session
+    AUTH_SAPISIDHASH = "sapisid"  # SAPISID hash from Google cookies
+
     def __init__(self, page: "Page", cookie_path=None, account_email: str | None = None):
         self._page = page
         self._token = None
+        self._auth_mode = None
+        self._sapisid = None
         self._session_id = str(uuid.uuid4())
         self._cookie_path = cookie_path
         self._account_email = account_email or "?"
@@ -72,6 +78,67 @@ class FlowClient:
         self._last_model_key = None
         self._recaptcha_provider = None
         self._recaptcha_fail_count = 0
+
+    def _make_sapisidhash(self, origin: str = "https://aisandbox-pa.googleapis.com") -> str:
+        """Compute SAPISIDHASH auth header value from SAPISID cookie."""
+        ts = str(int(time.time()))
+        raw = f"{ts} {self._sapisid} {origin}"
+        digest = hashlib.sha1(raw.encode()).hexdigest()
+        return f"SAPISIDHASH {ts}_{digest}"
+
+    def _get_auth_header(self, origin: str = "https://aisandbox-pa.googleapis.com") -> str:
+        """Return the Authorization header value based on current auth mode."""
+        if self._auth_mode == self.AUTH_SAPISIDHASH and self._sapisid:
+            return self._make_sapisidhash(origin)
+        return f"Bearer {self._token}"
+
+    async def _extract_sapisid(self) -> str | None:
+        """Extract SAPISID cookie from browser context."""
+        try:
+            all_cookies = await self._page.context.cookies()
+            for c in all_cookies:
+                if c.get("name") == "SAPISID" and "google.com" in c.get("domain", ""):
+                    return c.get("value")
+                if c.get("name") == "__Secure-3PAPISID" and "google.com" in c.get("domain", ""):
+                    return c.get("value")
+        except Exception as e:
+            log.debug(f"SAPISID extraction error: {e}")
+        return None
+
+    async def _try_sapisid_auth(self) -> bool:
+        """Try to authenticate using SAPISID hash (cookie-based auth)."""
+        sapisid = await self._extract_sapisid()
+        if not sapisid:
+            log.debug("No SAPISID cookie found")
+            return False
+
+        self._sapisid = sapisid
+        auth_header = self._make_sapisidhash()
+        cookie_dict = await self._get_cookies_for_httpx()
+
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15, cookies=cookie_dict) as client:
+                resp = await client.get(
+                    f"{AISANDBOX_BASE}/credits",
+                    headers={
+                        "Authorization": auth_header,
+                        "Origin": "https://labs.google",
+                        "Referer": "https://labs.google/",
+                        "x-client-data": X_CLIENT_DATA,
+                    },
+                )
+            if resp.status_code == 200:
+                log.info("SAPISID hash auth succeeded (cookie-based)")
+                self._auth_mode = self.AUTH_SAPISIDHASH
+                self._token = f"SAPISID:{sapisid[:8]}..."
+                return True
+            log.debug(f"SAPISID auth test HTTP {resp.status_code}")
+        except Exception as e:
+            log.debug(f"SAPISID auth test failed: {e}")
+
+        self._sapisid = None
+        return False
 
     async def _fetch_session_token(self):
         """Fetch access token from NextAuth session endpoint. Returns token or None."""
@@ -416,7 +483,14 @@ class FlowClient:
             return False
 
     async def ensure_token(self):
-        """Get ya29.* access token from NextAuth session."""
+        """Get authentication for Google aisandbox API.
+
+        Tries in order:
+        1. Cached token (from previous call)
+        2. NextAuth session token (ya29.* from labs.google session cookie)
+        3. SAPISID hash auth (computed from Google SAPISID cookie — no sign-in needed)
+        4. NextAuth sign-in flow (click "Sign in with Google" etc.)
+        """
         if self._token:
             return self._token
 
@@ -431,18 +505,23 @@ class FlowClient:
             await self._page.goto("https://labs.google/fx", wait_until="load", timeout=30000)
             await asyncio.sleep(3)
 
-        # Attempt 1: session might already be valid (e.g. labs.google cookies exist)
+        # Attempt 1: NextAuth session might already be valid
         token = await self._fetch_session_token()
         if token:
             self._token = token
+            self._auth_mode = self.AUTH_BEARER
             return token
 
-        # Attempt 2: complete the sign-in flow
-        log.info("No session token — attempting sign-in...")
+        # Attempt 2: SAPISID hash auth (uses Google cookies directly, no sign-in needed)
+        log.info("No session token — trying SAPISID cookie auth...")
+        if await self._try_sapisid_auth():
+            return self._token
+
+        # Attempt 3: NextAuth sign-in flow (may be blocked by Google)
+        log.info("SAPISID auth failed — attempting sign-in flow...")
         signed_in = await self._try_sign_in()
 
         if signed_in:
-            # Re-navigate to ensure page is on labs.google
             if "labs.google" not in (self._page.url or ""):
                 await self._page.goto("https://labs.google/fx", wait_until="load", timeout=30000)
                 await asyncio.sleep(3)
@@ -450,9 +529,10 @@ class FlowClient:
             token = await self._fetch_session_token()
             if token:
                 self._token = token
+                self._auth_mode = self.AUTH_BEARER
                 return token
 
-        # Attempt 3: try going directly to image-fx/video-fx which may trigger auth
+        # Attempt 4: try direct tool URL which may trigger auth
         log.info("Retrying via direct tool URL...")
         await self._page.goto("https://labs.google/fx/tools/image-fx", wait_until="load", timeout=30000)
         await asyncio.sleep(3)
@@ -460,10 +540,11 @@ class FlowClient:
         token = await self._fetch_session_token()
         if token:
             self._token = token
+            self._auth_mode = self.AUTH_BEARER
             return token
 
         raise RuntimeError(
-            "Could not get Google session access token. "
+            "Could not authenticate with Google. "
             "Cookies may be expired — try renewing in Settings → Tài khoản Google → Gia hạn"
         )
 
@@ -475,6 +556,8 @@ class FlowClient:
         """Force refresh of the session token."""
         log.info("Renewing session token...")
         self._token = None
+        self._auth_mode = None
+        self._sapisid = None
         token = await self.ensure_token()
         provider = self._recaptcha_provider
         if provider and getattr(provider, "is_running", False):
@@ -549,7 +632,7 @@ class FlowClient:
 
         payload = payload or {}
         headers = {
-            "Authorization": f"Bearer {self._token}",
+            "Authorization": self._get_auth_header("https://labs.google"),
             "Content-Type": "application/json",
             "x-client-data": X_CLIENT_DATA,
             "x-browser-validation": X_BROWSER_VALIDATION,
@@ -573,18 +656,20 @@ class FlowClient:
         url = f"{AISANDBOX_BASE}/{endpoint.lstrip('/')}"
         body_json = json.dumps(payload)
         for attempt in range(MAX_RETRY_COUNT):
+            auth = self._get_auth_header()
             result = await self._page.evaluate(
-                """async ({url, token, body}) => {
+                """async ({url, auth, body}) => {
                     const r = await fetch(url, {
                         method: "POST",
-                        headers: {"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+                        headers: {"Authorization": auth, "Content-Type": "application/json"},
+                        credentials: "include",
                         body
                     });
                     const text = await r.text();
                     try { return {status: r.status, ok: r.ok, json: JSON.parse(text)}; }
                     catch(e) { return {status: r.status, ok: r.ok, text}; }
                 }""",
-                {"url": url, "token": self._token, "body": body_json},
+                {"url": url, "auth": auth, "body": body_json},
             )
             if result.get("ok"):
                 return result.get("json")
@@ -600,7 +685,7 @@ class FlowClient:
         url = f"{AISANDBOX_BASE}/{endpoint.lstrip('/')}"
         body = raw_body if raw_body is not None else json.dumps(payload or {}).encode()
         headers = {
-            "Authorization": f"Bearer {self._token}",
+            "Authorization": self._get_auth_header(),
             "Content-Type": content_type,
             "Origin": "https://labs.google",
             "Referer": "https://labs.google/",
@@ -609,12 +694,13 @@ class FlowClient:
         }
         for attempt in range(MAX_RETRY_COUNT):
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
+                cookie_dict = await self._get_cookies_for_httpx()
+                async with httpx.AsyncClient(timeout=60, cookies=cookie_dict) as client:
                     resp = await client.post(url, content=body, headers=headers)
                 if resp.status_code in (401, 403):
                     log.warning(f"Sandbox auth failed HTTP {resp.status_code}, renewing token")
                     await self.renew_token()
-                    headers["Authorization"] = f"Bearer {self._token}"
+                    headers["Authorization"] = self._get_auth_header()
                     await asyncio.sleep(1 + attempt)
                     continue
                 resp.raise_for_status()
@@ -637,11 +723,10 @@ class FlowClient:
     async def _video_gen_httpx(self, url: str, payload: dict):
         import httpx
 
-        token = self._token
         cookie_dict = await self._get_cookies_for_httpx()
         ua = await self._page.evaluate("() => navigator.userAgent")
         headers = {
-            "Authorization": f"Bearer {token}",
+            "Authorization": self._get_auth_header(),
             "Content-Type": "application/json",
             "Origin": "https://labs.google",
             "Referer": "https://labs.google/",
@@ -660,18 +745,20 @@ class FlowClient:
         """Check remaining video credits via aisandbox API."""
         await self.ensure_token()
         try:
+            auth = self._get_auth_header()
             result = await self._page.evaluate(
-                """async (token) => {
+                """async (auth) => {
                     try {
                         const r = await fetch("https://aisandbox-pa.googleapis.com/v1/whisk:getVideoCreditStatus", {
                             method: "GET",
-                            headers: {"Authorization": "Bearer " + token, "Origin": "https://labs.google", "Referer": "https://labs.google/"}
+                            headers: {"Authorization": auth, "Origin": "https://labs.google", "Referer": "https://labs.google/"},
+                            credentials: "include"
                         });
                         if (r.ok) return await r.json();
                         return {error: r.status};
                     } catch(e) { return {error: e.message}; }
                 }""",
-                self._token,
+                auth,
             )
             if result.get("error"):
                 log.warning(f"Credit check failed: {json.dumps(result)[:300]}")
@@ -841,15 +928,16 @@ class FlowClient:
             try:
                 if self._page.is_closed():
                     raise RuntimeError("Browser page is closed")
+                auth = self._get_auth_header()
                 result = await asyncio.wait_for(
                     self._page.evaluate(
-                        """async ({url, token, body}) => {
-                            const r = await fetch(url, {method: "POST", headers: {"Authorization": "Bearer " + token, "Content-Type": "application/json"}, body});
+                        """async ({url, auth, body}) => {
+                            const r = await fetch(url, {method: "POST", headers: {"Authorization": auth, "Content-Type": "application/json"}, credentials: "include", body});
                             const text = await r.text();
                             try { return {ok: r.ok, status: r.status, json: JSON.parse(text)}; }
                             catch(e) { return {ok: r.ok, status: r.status, text}; }
                         }""",
-                        {"url": url, "token": self._token, "body": body_json},
+                        {"url": url, "auth": auth, "body": body_json},
                     ),
                     timeout=120,
                 )
