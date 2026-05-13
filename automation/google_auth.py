@@ -190,8 +190,17 @@ class GoogleAuth:
             return False
 
     async def _update_session_info(self, account: Account, page: Page):
-        """Update account session data in DB."""
+        """Update account session data in DB.
+
+        IMPORTANT: After Google login, navigates to labs.google/fx to establish
+        the Labs session BEFORE exporting cookies. This ensures cookies_export.json
+        contains the labs.google session cookie needed by ensure_token().
+        """
         context = page.context
+
+        # Navigate to labs.google/fx to establish session cookie
+        await self._establish_labs_session(page)
+
         cookies = await context.cookies()
 
         max_exp = 0
@@ -207,6 +216,17 @@ class GoogleAuth:
         else:
             cookie_exp = datetime.now() + timedelta(days=30)
         account.cookie_exp = cookie_exp
+
+        # Check if labs.google session token was obtained
+        token_exp = None
+        for cookie in cookies:
+            if "labs.google" in cookie.get("domain", ""):
+                exp = cookie.get("expires", 0)
+                if exp > 0:
+                    token_exp = datetime.fromtimestamp(exp)
+                    break
+        if token_exp:
+            account.token_exp = token_exp
 
         profile_dir = self._browser._profiles.get(account.id, "")
         if profile_dir:
@@ -239,3 +259,50 @@ class GoogleAuth:
             f"Updated session for {account.email}: tier={account.tier}, "
             f"credit={account.credit}, exp={cookie_exp.strftime('%Y-%m-%d')}"
         )
+
+    async def _establish_labs_session(self, page: Page):
+        """Navigate to labs.google/fx and establish NextAuth session.
+
+        This is critical: without visiting labs.google and completing the
+        sign-in flow, the session cookie for labs.google won't be created,
+        and ensure_token() will get {} from /api/auth/session.
+        """
+        try:
+            log.info("Establishing labs.google session...")
+            await page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
+
+            # Check if sign-in button is visible (session not yet established)
+            btn = await page.query_selector(
+                'a[href*="accounts.google.com"], button:has-text("Sign in"), '
+                'a:has-text("Sign in"), button:has-text("Đăng nhập")'
+            )
+            if btn and await btn.is_visible():
+                log.info("Clicking Sign in on labs.google...")
+                try:
+                    async with page.context.expect_page(timeout=5000) as pi:
+                        await btn.click()
+                    popup = await pi.value
+                    await popup.wait_for_event("close", timeout=30000)
+                except Exception:
+                    await btn.click()
+                await asyncio.sleep(3)
+
+            # Wait and verify session is established
+            for attempt in range(5):
+                result = await page.evaluate(
+                    """async () => {
+                        const r = await fetch("https://labs.google/fx/api/auth/session", {credentials: "include"});
+                        if (!r.ok) return {};
+                        return await r.json();
+                    }"""
+                )
+                token = (result or {}).get("accessToken") or (result or {}).get("access_token")
+                if token:
+                    log.info("Labs.google session established successfully")
+                    return
+                await asyncio.sleep(2)
+
+            log.warning("Could not verify labs.google session — cookies may be incomplete")
+        except Exception as e:
+            log.warning(f"Failed to establish labs.google session: {e}")

@@ -33,25 +33,78 @@ _ANTI_DETECT_JS = """
 """
 
 _RECAPTCHA_JS = """async (action) => {
+    // Strategy 1: Find site key from script[src*="recaptcha"] render param
     let siteKey = null;
     const scripts = document.querySelectorAll('script[src*="recaptcha"]');
     for (const s of scripts) {
         const m = s.src.match(/[?&]render=([^&]+)/);
-        if (m) { siteKey = m[1]; break; }
+        if (m && m[1] !== 'explicit') { siteKey = m[1]; break; }
     }
-    if (!siteKey) return {error: 'no_site_key'};
 
-    if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
-        try {
-            const token = await grecaptcha.enterprise.execute(
-                siteKey, {action: action}
-            );
-            if (token) return {token, key: siteKey};
-        } catch(e) {
-            return {error: e.message};
+    // Strategy 2: Find from ___grecaptcha_cfg (internal config)
+    if (!siteKey && window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
+        const clients = window.___grecaptcha_cfg.clients;
+        for (const id in clients) {
+            const client = clients[id];
+            if (client && client.sitekey) { siteKey = client.sitekey; break; }
+            // Sometimes nested differently
+            for (const k in client) {
+                const v = client[k];
+                if (v && typeof v === 'object') {
+                    for (const k2 in v) {
+                        const v2 = v[k2];
+                        if (v2 && typeof v2 === 'object' && v2.sitekey) {
+                            siteKey = v2.sitekey;
+                            break;
+                        }
+                    }
+                }
+                if (siteKey) break;
+            }
+            if (siteKey) break;
         }
     }
-    return {error: 'grecaptcha_not_available'};
+
+    // Strategy 3: Find from data-sitekey attribute
+    if (!siteKey) {
+        const el = document.querySelector('[data-sitekey]');
+        if (el) siteKey = el.getAttribute('data-sitekey');
+    }
+
+    // Strategy 4: Find from page source (inline scripts)
+    if (!siteKey) {
+        const inlineScripts = document.querySelectorAll('script:not([src])');
+        for (const s of inlineScripts) {
+            const txt = s.textContent || '';
+            const m = txt.match(/['"]([A-Za-z0-9_-]{40})['"]/);
+            if (m && txt.includes('recaptcha')) { siteKey = m[1]; break; }
+        }
+    }
+
+    if (!siteKey) return {error: 'no_site_key'};
+
+    if (typeof grecaptcha === 'undefined' || !grecaptcha.enterprise) {
+        return {error: 'grecaptcha_not_available'};
+    }
+
+    try {
+        const token = await grecaptcha.enterprise.execute(siteKey, {action: action});
+        if (token) return {token, key: siteKey};
+        return {error: 'empty_token'};
+    } catch(e) {
+        // If "No reCAPTCHA clients exist", try rendering first
+        if (e.message && e.message.includes('No reCAPTCHA clients')) {
+            try {
+                grecaptcha.enterprise.render(document.createElement('div'), {sitekey: siteKey});
+                await new Promise(r => setTimeout(r, 1000));
+                const token = await grecaptcha.enterprise.execute(siteKey, {action: action});
+                if (token) return {token, key: siteKey};
+            } catch(e2) {
+                return {error: e2.message};
+            }
+        }
+        return {error: e.message};
+    }
 }"""
 
 VIDEO_FX_URL = "https://labs.google/fx/tools/video-fx"
@@ -145,13 +198,13 @@ class SubprocessTokenProvider:
         self._page = await self._context.new_page()
         await self._page.goto(
             VIDEO_FX_URL,
-            wait_until='domcontentloaded',
-            timeout=20000,
+            wait_until='networkidle',
+            timeout=30000,
         )
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
-        for i in range(30):
+        for i in range(60):
             has = await self._page.evaluate(
                 "typeof grecaptcha !== 'undefined' && (!!grecaptcha.enterprise || !!grecaptcha.execute)"
             )
@@ -171,10 +224,10 @@ class SubprocessTokenProvider:
         try:
             log.info(f'SubprocessTokenProvider: harvesting token (action={action})...')
 
-            await self._page.reload(wait_until='domcontentloaded', timeout=20000)
-            await asyncio.sleep(2)
+            await self._page.reload(wait_until='networkidle', timeout=30000)
+            await asyncio.sleep(3)
 
-            for i in range(30):
+            for i in range(60):
                 has = await self._page.evaluate(
                     "typeof grecaptcha !== 'undefined' && (!!grecaptcha.enterprise || !!grecaptcha.execute)"
                 )

@@ -79,37 +79,49 @@ class FlowClient:
             return self._token
 
         log.info("Getting session token...")
+
+        # Step 1: Navigate to labs.google with networkidle (wait for full JS load)
         if "labs.google" not in (self._page.url or ""):
-            await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=30000)
+            await self._page.goto("https://labs.google/fx", wait_until="networkidle", timeout=30000)
+        else:
+            await self._page.reload(wait_until="networkidle", timeout=30000)
+
+        # Step 2: Poll session — page JS may auto-establish session
+        for attempt in range(5):
             await asyncio.sleep(2)
+            result = await self._fetch_session()
+            token = self._extract_token(result)
+            if token:
+                log.info(f"Session token obtained (attempt {attempt + 1}): {token[:15]}...")
+                self._token = token
+                return token
 
-        # First attempt: try fetching session directly
-        result = await self._fetch_session()
-        token = self._extract_token(result)
-        if token:
-            self._token = token
-            return token
-
-        # Session empty — trigger NextAuth sign-in flow via Google OAuth
-        log.info("Session empty, initiating NextAuth sign-in flow...")
+        # Step 3: Session still empty — try sign-in strategies
+        log.info("Session empty after polling, trying sign-in strategies...")
         token = await self._trigger_nextauth_signin()
         if token:
             self._token = token
             return token
 
-        # Fallback: try clicking Sign-in button (popup flow)
+        # Step 4: Final fallback — click Sign-in button on page
         try:
+            await self._page.goto("https://labs.google/fx", wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(3)
             btn = await self._page.query_selector(
                 'a[href*="accounts.google.com"], button:has-text("Sign in"), '
-                'a:has-text("Sign in"), button:has-text("Đăng nhập")'
+                'a:has-text("Sign in"), button:has-text("Đăng nhập"), '
+                '[data-action="sign-in"]'
             )
-            if btn and await btn.is_visible(timeout=5000):
+            if btn and await btn.is_visible():
                 log.info("Clicking Sign in button...")
-                async with self._page.context.expect_page() as pi:
+                try:
+                    async with self._page.context.expect_page(timeout=5000) as pi:
+                        await btn.click()
+                    popup = await pi.value
+                    await popup.wait_for_event("close", timeout=30000)
+                except Exception:
                     await btn.click()
-                popup = await pi.value
-                await popup.wait_for_event("close", timeout=30000)
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
                 result = await self._fetch_session()
                 token = self._extract_token(result)
                 if token:
@@ -141,98 +153,222 @@ class FlowClient:
         return result.get("accessToken") or result.get("access_token") or None
 
     async def _trigger_nextauth_signin(self) -> str | None:
-        """Trigger NextAuth Google sign-in programmatically.
+        """Trigger Google sign-in for labs.google via multiple strategies.
 
-        Flow:
-          1. GET /api/auth/csrf → csrfToken
-          2. Navigate to /api/auth/signin/google (with CSRF) → OAuth redirect
-          3. Google auto-approves (cookies present) → redirect back
-          4. NextAuth sets session cookie
-          5. GET /api/auth/session → accessToken
+        Strategy 1: Google ServiceLogin with continue param (most reliable)
+        Strategy 2: Direct NextAuth signin endpoint navigation
+        Strategy 3: Click sign-in button on the page
         """
-        try:
-            # Step 1: Get CSRF token
-            csrf_result = await self._page.evaluate(
-                """async () => {
-                    const r = await fetch("https://labs.google/fx/api/auth/csrf", {credentials: "include"});
-                    if (!r.ok) return {error: r.status};
-                    return await r.json();
-                }"""
-            )
-            csrf_token = (csrf_result or {}).get("csrfToken")
-            if not csrf_token:
-                log.warning(f"NextAuth CSRF token not available: {csrf_result}")
-                return None
+        strategies = [
+            self._strategy_service_login,
+            self._strategy_nextauth_endpoint,
+            self._strategy_page_signin_button,
+        ]
+        for strategy in strategies:
+            try:
+                token = await strategy()
+                if token:
+                    return token
+            except Exception as e:
+                log.debug(f"Strategy {strategy.__name__} failed: {e}")
+        return None
 
-            log.info("Got CSRF token, triggering Google OAuth sign-in...")
+    async def _strategy_service_login(self) -> str | None:
+        """Navigate through Google ServiceLogin with continue=labs.google/fx.
 
-            # Step 2: POST to signin/google endpoint — this triggers OAuth redirect
-            signin_result = await self._page.evaluate(
-                """async ({csrfToken}) => {
-                    const r = await fetch("https://labs.google/fx/api/auth/signin/google", {
-                        method: "POST",
-                        credentials: "include",
-                        headers: {"Content-Type": "application/x-www-form-urlencoded"},
-                        body: "csrfToken=" + encodeURIComponent(csrfToken) +
-                              "&callbackUrl=" + encodeURIComponent("https://labs.google/fx") +
-                              "&json=true"
-                    });
-                    if (!r.ok) return {error: r.status};
-                    return await r.json();
-                }""",
-                {"csrfToken": csrf_token},
-            )
+        When Google cookies are present, ServiceLogin auto-redirects to the
+        continue URL with proper auth context, which establishes the session.
+        """
+        log.info("Trying Google ServiceLogin with continue param...")
+        login_url = (
+            "https://accounts.google.com/ServiceLogin"
+            "?continue=https%3A%2F%2Flabs.google%2Ffx"
+            "&service=labs"
+        )
+        await self._page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
 
-            # The response should contain a redirect URL to Google OAuth
-            redirect_url = (signin_result or {}).get("url")
-            if not redirect_url:
-                log.warning(f"NextAuth signin did not return redirect URL: {signin_result}")
-                return None
+        # Wait for redirect chain: Google → labs.google
+        for i in range(20):
+            await asyncio.sleep(1)
+            current_url = self._page.url or ""
+            if "labs.google" in current_url and "accounts.google" not in current_url:
+                log.info(f"ServiceLogin redirect complete: {current_url[:80]}")
+                break
+            # Handle account chooser
+            if "accounts.google.com" in current_url and i > 3:
+                try:
+                    account_el = await self._page.query_selector(
+                        'div[data-email], li[data-email], div[data-identifier], '
+                        'div.JDAKTe, a[data-email]'
+                    )
+                    if account_el and await account_el.is_visible():
+                        log.info("Clicking account in chooser...")
+                        await account_el.click()
+                        await asyncio.sleep(3)
+                except Exception:
+                    pass
 
-            log.info("Navigating to Google OAuth for auto-approval...")
+        # Ensure we're on labs.google
+        if "labs.google" not in (self._page.url or ""):
+            await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
 
-            # Step 3: Navigate to OAuth URL — Google cookies auto-approve
-            await self._page.goto(redirect_url, wait_until="domcontentloaded", timeout=30000)
+        # Wait for page scripts to establish session
+        await asyncio.sleep(3)
+        result = await self._fetch_session()
+        token = self._extract_token(result)
+        if token:
+            log.info("ServiceLogin strategy successful")
+            return token
+        return None
 
-            # Wait for redirect chain to complete (back to labs.google)
-            for _ in range(20):
-                await asyncio.sleep(1)
-                if "labs.google" in (self._page.url or ""):
-                    break
+    async def _strategy_nextauth_endpoint(self) -> str | None:
+        """Navigate to NextAuth signin endpoint directly."""
+        log.info("Trying NextAuth signin endpoint...")
+        signin_url = "https://labs.google/fx/api/auth/signin/google?callbackUrl=https%3A%2F%2Flabs.google%2Ffx"
+        await self._page.goto(signin_url, wait_until="domcontentloaded", timeout=30000)
 
-            if "labs.google" not in (self._page.url or ""):
-                log.warning(f"OAuth redirect did not return to labs.google. Current URL: {self._page.url}")
-                # Try navigating back
-                await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
-                await asyncio.sleep(2)
+        for _ in range(15):
+            await asyncio.sleep(1)
+            current_url = self._page.url or ""
+            if "labs.google" in current_url and "/api/auth/" not in current_url:
+                break
+            if "accounts.google.com" in current_url:
+                try:
+                    el = await self._page.query_selector(
+                        'div[data-email], li[data-email], div.JDAKTe'
+                    )
+                    if el and await el.is_visible():
+                        await el.click()
+                        await asyncio.sleep(3)
+                except Exception:
+                    pass
 
-            # Step 4: Fetch session — should now have accessToken
-            result = await self._fetch_session()
-            token = self._extract_token(result)
-            if token:
-                log.info("NextAuth sign-in successful, got access token")
-                return token
+        if "labs.google" not in (self._page.url or ""):
+            await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
 
-            log.warning(f"NextAuth sign-in completed but session still empty: {result}")
-            return None
-        except Exception as e:
-            log.error(f"NextAuth sign-in flow failed: {e}")
-            return None
+        await asyncio.sleep(2)
+        result = await self._fetch_session()
+        token = self._extract_token(result)
+        if token:
+            log.info("NextAuth endpoint strategy successful")
+            return token
+        return None
+
+    async def _strategy_page_signin_button(self) -> str | None:
+        """Navigate to labs.google/fx and look for sign-in UI elements."""
+        log.info("Trying page sign-in button strategy...")
+        if "labs.google" not in (self._page.url or ""):
+            await self._page.goto("https://labs.google/fx", wait_until="networkidle", timeout=30000)
+        else:
+            await self._page.reload(wait_until="networkidle", timeout=30000)
+
+        await asyncio.sleep(3)
+
+        # Look for various sign-in patterns
+        selectors = [
+            'button:has-text("Sign in")',
+            'a:has-text("Sign in")',
+            'button:has-text("Đăng nhập")',
+            'a[href*="accounts.google.com/signin"]',
+            'a[href*="accounts.google.com/ServiceLogin"]',
+            '[data-action="sign-in"]',
+            '.sign-in-button',
+            'button[aria-label*="Sign in"]',
+        ]
+        for selector in selectors:
+            try:
+                btn = await self._page.query_selector(selector)
+                if btn and await btn.is_visible():
+                    log.info(f"Found sign-in element: {selector}")
+                    # Try popup flow
+                    try:
+                        async with self._page.context.expect_page(timeout=5000) as pi:
+                            await btn.click()
+                        popup = await pi.value
+                        await popup.wait_for_event("close", timeout=30000)
+                    except Exception:
+                        # No popup — might be a regular navigation
+                        await btn.click()
+                    await asyncio.sleep(3)
+
+                    # Check if redirected to Google, wait for return
+                    for _ in range(15):
+                        if "labs.google" in (self._page.url or ""):
+                            break
+                        await asyncio.sleep(1)
+
+                    if "labs.google" not in (self._page.url or ""):
+                        await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
+
+                    await asyncio.sleep(2)
+                    result = await self._fetch_session()
+                    token = self._extract_token(result)
+                    if token:
+                        log.info("Page sign-in button strategy successful")
+                        return token
+            except Exception:
+                continue
+        return None
 
     def set_recaptcha_provider(self, provider):
         """Set external reCAPTCHA token provider (SubprocessTokenProvider)."""
         self._recaptcha_provider = provider
 
     async def renew_token(self):
-        """Force refresh of the session token."""
-        log.info("Renewing session token...")
+        """Force refresh of the session token by re-triggering sign-in.
+
+        Unlike ensure_token() which just reloads the page, renew_token()
+        forces a full re-authentication to get a genuinely fresh token.
+        This is called when the current token gets 401/403 from the API.
+        """
+        log.info("Renewing session token (forcing re-sign-in)...")
         self._token = None
-        token = await self.ensure_token()
+
+        # First try: sign out then sign back in (forces new token)
+        try:
+            await self._page.goto(
+                "https://labs.google/fx/api/auth/signout",
+                wait_until="domcontentloaded", timeout=10000,
+            )
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+
+        # Navigate back and try to establish a fresh session
+        await self._page.goto("https://labs.google/fx", wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(3)
+
+        # Try fetching session after page reload
+        result = await self._fetch_session()
+        token = self._extract_token(result)
+
+        if not token:
+            # Session empty after signout — trigger sign-in flow
+            log.info("Session empty after signout, triggering sign-in...")
+            token = await self._trigger_nextauth_signin()
+
+        if not token:
+            # Last resort: reload and poll
+            for attempt in range(5):
+                await asyncio.sleep(2)
+                result = await self._fetch_session()
+                token = self._extract_token(result)
+                if token:
+                    break
+
+        if token:
+            self._token = token
+            log.info(f"Token renewed successfully ({token[:10]}...)")
+        else:
+            log.error("Token renewal failed — could not get fresh token")
+            raise RuntimeError("Could not renew Google session access token")
+
         provider = self._recaptcha_provider
-        if provider and getattr(provider, "is_running", lambda: False)():
+        if provider and getattr(provider, "is_running", False):
             try:
                 cookies = await self._page.context.cookies()
-                provider.refresh_cookies(cookies)
+                await provider.refresh_cookies(cookies)
             except Exception as e:
                 log.warning(f"Failed to refresh provider cookies: {e}")
         return token
@@ -254,8 +390,53 @@ class FlowClient:
             result = await self._page.evaluate(
                 """async (action) => {
                     if (!window.grecaptcha || !grecaptcha.enterprise) return {error: "grecaptcha missing"};
-                    const token = await grecaptcha.enterprise.execute(undefined, {action});
-                    return {token};
+
+                    // Find site key from multiple sources
+                    let siteKey = null;
+                    // From script src render param
+                    const scripts = document.querySelectorAll('script[src*="recaptcha"]');
+                    for (const s of scripts) {
+                        const m = s.src.match(/[?&]render=([^&]+)/);
+                        if (m && m[1] !== 'explicit') { siteKey = m[1]; break; }
+                    }
+                    // From ___grecaptcha_cfg
+                    if (!siteKey && window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
+                        const clients = window.___grecaptcha_cfg.clients;
+                        for (const id in clients) {
+                            const c = clients[id];
+                            if (c && c.sitekey) { siteKey = c.sitekey; break; }
+                            for (const k in c) {
+                                const v = c[k];
+                                if (v && typeof v === 'object') {
+                                    for (const k2 in v) {
+                                        if (v[k2] && v[k2].sitekey) { siteKey = v[k2].sitekey; break; }
+                                    }
+                                }
+                                if (siteKey) break;
+                            }
+                            if (siteKey) break;
+                        }
+                    }
+                    // From data-sitekey attribute
+                    if (!siteKey) {
+                        const el = document.querySelector('[data-sitekey]');
+                        if (el) siteKey = el.getAttribute('data-sitekey');
+                    }
+
+                    try {
+                        const token = await grecaptcha.enterprise.execute(siteKey || undefined, {action});
+                        return {token};
+                    } catch(e) {
+                        if (siteKey && e.message && e.message.includes('No reCAPTCHA clients')) {
+                            try {
+                                grecaptcha.enterprise.render(document.createElement('div'), {sitekey: siteKey});
+                                await new Promise(r => setTimeout(r, 1000));
+                                const token = await grecaptcha.enterprise.execute(siteKey, {action});
+                                return {token};
+                            } catch(e2) { return {error: e2.message}; }
+                        }
+                        return {error: e.message};
+                    }
                 }""",
                 action,
             )
