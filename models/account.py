@@ -20,6 +20,7 @@ class Account:
     credit: int = 0
     enabled: bool = True
     gemini_api_key: str = ""
+    token_exp: Optional[datetime] = None
 
     @classmethod
     def from_row(cls, row: tuple) -> Account:
