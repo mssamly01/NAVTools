@@ -83,20 +83,48 @@ class FlowClient:
             await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
 
+        # First attempt: try fetching session directly
+        result = await self._fetch_session()
+        token = self._extract_token(result)
+        if token:
+            self._token = token
+            return token
+
+        # Session empty — trigger NextAuth sign-in flow via Google OAuth
+        log.info("Session empty, initiating NextAuth sign-in flow...")
+        token = await self._trigger_nextauth_signin()
+        if token:
+            self._token = token
+            return token
+
+        # Fallback: try clicking Sign-in button (popup flow)
         try:
             btn = await self._page.query_selector(
-                'a[href*="accounts.google.com"], button:has-text("Sign in"), a:has-text("Sign in")'
+                'a[href*="accounts.google.com"], button:has-text("Sign in"), '
+                'a:has-text("Sign in"), button:has-text("Đăng nhập")'
             )
-            if btn and await btn.is_visible(timeout=15000):
-                log.info("Clicking Sign in...")
+            if btn and await btn.is_visible(timeout=5000):
+                log.info("Clicking Sign in button...")
                 async with self._page.context.expect_page() as pi:
                     await btn.click()
                 popup = await pi.value
-                await popup.wait_for_event("close", timeout=20000)
-        except Exception:
-            pass
+                await popup.wait_for_event("close", timeout=30000)
+                await asyncio.sleep(2)
+                result = await self._fetch_session()
+                token = self._extract_token(result)
+                if token:
+                    self._token = token
+                    return token
+        except Exception as e:
+            log.warning(f"Sign-in button fallback failed: {e}")
 
-        result = await self._page.evaluate(
+        err = json.dumps(result, ensure_ascii=False)[:500]
+        log.error(f"Session token missing after all attempts: {err}")
+        raise RuntimeError("Could not get Google session access token")
+
+    async def _fetch_session(self) -> dict:
+        """Fetch NextAuth session JSON."""
+        return await self._page.evaluate(
             """async (url) => {
                 const r = await fetch(url, {credentials: "include"});
                 if (!r.ok) return {error: r.status};
@@ -104,13 +132,92 @@ class FlowClient:
             }""",
             self.SESSION_URL,
         )
-        token = (result or {}).get("accessToken") or (result or {}).get("access_token")
-        if not token:
-            err = json.dumps(result, ensure_ascii=False)[:500]
-            log.error(f"Session token missing: {err}")
-            raise RuntimeError("Could not get Google session access token")
-        self._token = token
-        return token
+
+    @staticmethod
+    def _extract_token(result) -> str | None:
+        """Extract access token from session response."""
+        if not result or not isinstance(result, dict):
+            return None
+        return result.get("accessToken") or result.get("access_token") or None
+
+    async def _trigger_nextauth_signin(self) -> str | None:
+        """Trigger NextAuth Google sign-in programmatically.
+
+        Flow:
+          1. GET /api/auth/csrf → csrfToken
+          2. Navigate to /api/auth/signin/google (with CSRF) → OAuth redirect
+          3. Google auto-approves (cookies present) → redirect back
+          4. NextAuth sets session cookie
+          5. GET /api/auth/session → accessToken
+        """
+        try:
+            # Step 1: Get CSRF token
+            csrf_result = await self._page.evaluate(
+                """async () => {
+                    const r = await fetch("https://labs.google/fx/api/auth/csrf", {credentials: "include"});
+                    if (!r.ok) return {error: r.status};
+                    return await r.json();
+                }"""
+            )
+            csrf_token = (csrf_result or {}).get("csrfToken")
+            if not csrf_token:
+                log.warning(f"NextAuth CSRF token not available: {csrf_result}")
+                return None
+
+            log.info("Got CSRF token, triggering Google OAuth sign-in...")
+
+            # Step 2: POST to signin/google endpoint — this triggers OAuth redirect
+            signin_result = await self._page.evaluate(
+                """async ({csrfToken}) => {
+                    const r = await fetch("https://labs.google/fx/api/auth/signin/google", {
+                        method: "POST",
+                        credentials: "include",
+                        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+                        body: "csrfToken=" + encodeURIComponent(csrfToken) +
+                              "&callbackUrl=" + encodeURIComponent("https://labs.google/fx") +
+                              "&json=true"
+                    });
+                    if (!r.ok) return {error: r.status};
+                    return await r.json();
+                }""",
+                {"csrfToken": csrf_token},
+            )
+
+            # The response should contain a redirect URL to Google OAuth
+            redirect_url = (signin_result or {}).get("url")
+            if not redirect_url:
+                log.warning(f"NextAuth signin did not return redirect URL: {signin_result}")
+                return None
+
+            log.info("Navigating to Google OAuth for auto-approval...")
+
+            # Step 3: Navigate to OAuth URL — Google cookies auto-approve
+            await self._page.goto(redirect_url, wait_until="domcontentloaded", timeout=30000)
+
+            # Wait for redirect chain to complete (back to labs.google)
+            for _ in range(20):
+                await asyncio.sleep(1)
+                if "labs.google" in (self._page.url or ""):
+                    break
+
+            if "labs.google" not in (self._page.url or ""):
+                log.warning(f"OAuth redirect did not return to labs.google. Current URL: {self._page.url}")
+                # Try navigating back
+                await self._page.goto("https://labs.google/fx", wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(2)
+
+            # Step 4: Fetch session — should now have accessToken
+            result = await self._fetch_session()
+            token = self._extract_token(result)
+            if token:
+                log.info("NextAuth sign-in successful, got access token")
+                return token
+
+            log.warning(f"NextAuth sign-in completed but session still empty: {result}")
+            return None
+        except Exception as e:
+            log.error(f"NextAuth sign-in flow failed: {e}")
+            return None
 
     def set_recaptcha_provider(self, provider):
         """Set external reCAPTCHA token provider (SubprocessTokenProvider)."""
