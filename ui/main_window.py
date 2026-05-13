@@ -80,7 +80,6 @@ class MainWindow(QMainWindow):
         self._content_pages = []
         for key, mode in zip(mode_keys, modes):
             page = ContentPage(mode=mode, db=self.db)
-            page.start_task.connect(self._on_start_task)
             page.open_settings.connect(self._open_settings)
             self._content_pages.append(page)
             self.pages[key] = page

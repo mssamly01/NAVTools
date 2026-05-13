@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import itertools
 import time
 import uuid
 from pathlib import Path
@@ -11,6 +12,8 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QRunnable, QThread, QThreadPool, Signal
 
 from utils.logger import log
+
+_task_id_counter = itertools.count(1)
 
 
 class WorkerSignals(QObject):
@@ -82,7 +85,10 @@ class TaskWorker(QThread):
 
     def run(self):
         task = self.task
-        task_id = id(task) if isinstance(task, dict) else getattr(task, "id", 0)
+        task_id = getattr(task, "id", None)
+        if task_id is None or not isinstance(task_id, int):
+            task_id = next(_task_id_counter)
+        self._task_id = task_id
         try:
             asyncio.run(self._async_execute(task, task_id))
         except Exception as e:
@@ -259,7 +265,8 @@ class TaskManager(QObject):
 
     def start_task(self, task):
         worker = TaskWorker(task, self.db, self.browser_manager, self.account_pool)
-        task_id = getattr(task, "id", id(worker))
+        task_id = next(_task_id_counter)
+        worker._task_id = task_id
         self.workers[task_id] = worker
         worker.finished.connect(lambda tid=task_id: self._on_task_done(tid))
         worker.start()
