@@ -43,7 +43,11 @@ from utils.platform import find_chrome
 
 
 def _read_chrome_cookies(profile_dir: Path):
-    """Read email and cookie expiry from a Chrome profile."""
+    """Read email and cookie expiry from a Chrome profile.
+
+    Handles the case where Chrome is running and locks the Cookies DB.
+    Falls back to cookies_export.json or a default expiry.
+    """
     info = {"email": None, "cookie_exp": None}
     profile_dir = Path(profile_dir)
     for prefs_name in ("Default/Preferences", "Default/Secure Preferences"):
@@ -61,34 +65,79 @@ def _read_chrome_cookies(profile_dir: Path):
         except Exception as e:
             log.warning(f"Could not read {prefs_file}: {e}")
 
+    # Try reading cookie expiry from Chrome's Cookies DB
     cookies_db = profile_dir / "Default" / "Network" / "Cookies"
     if not cookies_db.exists():
         cookies_db = profile_dir / "Default" / "Cookies"  # Older Chrome versions
 
-    tmp_db = profile_dir / f"cookies_copy_{id(profile_dir)}.db"
+    db_read_ok = False
     if cookies_db.exists():
-        for attempt in range(5):
+        # Method 1: Copy DB file then read (works when Chrome is not running)
+        tmp_db = profile_dir / f"cookies_copy_{os.getpid()}.db"
+        for attempt in range(3):
             try:
-                # Use shutil.copy instead of copy2 to avoid metadata lock issues
                 shutil.copy(cookies_db, tmp_db)
                 conn = sqlite3.connect(str(tmp_db))
-                # Google cookies often have 'google.com' in host_key
                 row = conn.execute("SELECT MAX(expires_utc) FROM cookies WHERE host_key LIKE '%google.com%'").fetchone()
                 conn.close()
                 if row and row[0]:
                     chrome_epoch = datetime(1601, 1, 1)
                     info["cookie_exp"] = chrome_epoch + timedelta(microseconds=int(row[0]))
-                break # Success
+                db_read_ok = True
+                break
+            except PermissionError:
+                time.sleep(0.5)
             except Exception as e:
-                if attempt == 4:
-                    log.warning(f"Could not read Cookies DB after 5 attempts: {e}")
-                time.sleep(1)
+                if attempt == 2:
+                    log.debug(f"Cookies DB copy failed: {e}")
+                time.sleep(0.5)
             finally:
                 try:
                     if tmp_db.exists():
                         os.remove(tmp_db)
                 except Exception:
                     pass
+
+        # Method 2: Try direct read-only SQLite connection (WAL mode may allow it)
+        if not db_read_ok:
+            try:
+                uri = f"file:{cookies_db}?mode=ro&nolock=1"
+                conn = sqlite3.connect(uri, uri=True)
+                row = conn.execute("SELECT MAX(expires_utc) FROM cookies WHERE host_key LIKE '%google.com%'").fetchone()
+                conn.close()
+                if row and row[0]:
+                    chrome_epoch = datetime(1601, 1, 1)
+                    info["cookie_exp"] = chrome_epoch + timedelta(microseconds=int(row[0]))
+                db_read_ok = True
+            except Exception:
+                pass
+
+    # Method 3: Fallback — read expiry from cookies_export.json (already exported by Playwright)
+    if not db_read_ok:
+        cookies_json = profile_dir / "cookies_export.json"
+        if cookies_json.exists():
+            try:
+                with cookies_json.open("r", encoding="utf-8") as f:
+                    cookies = json.load(f)
+                max_exp = 0
+                for c in cookies:
+                    domain = c.get("domain", "")
+                    if "google" in domain:
+                        exp = c.get("expires", 0)
+                        if isinstance(exp, (int, float)) and exp > max_exp:
+                            max_exp = exp
+                if max_exp > 0:
+                    info["cookie_exp"] = datetime.fromtimestamp(max_exp)
+                    log.info(f"Cookie expiry from cookies_export.json: {info['cookie_exp']}")
+                db_read_ok = True
+            except Exception as e:
+                log.debug(f"Could not read cookies_export.json for expiry: {e}")
+
+    # Method 4: Default expiry if all else fails
+    if not db_read_ok and not info["cookie_exp"]:
+        info["cookie_exp"] = datetime.now() + timedelta(days=30)
+        log.info("Using default cookie expiry (30 days) — Chrome may be locking the DB")
+
     return info
 
 
