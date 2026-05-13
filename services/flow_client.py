@@ -61,15 +61,9 @@ class FlowClient:
         "Imagen 4 Ultra": "IMAGEN_4_ULTRA",
     }
 
-    # Auth modes
-    AUTH_BEARER = "bearer"       # ya29.* from NextAuth session
-    AUTH_SAPISIDHASH = "sapisid"  # SAPISID hash from Google cookies
-
     def __init__(self, page: "Page", cookie_path=None, account_email: str | None = None):
         self._page = page
         self._token = None
-        self._auth_mode = None
-        self._sapisid = None
         self._session_id = str(uuid.uuid4())
         self._cookie_path = cookie_path
         self._account_email = account_email or "?"
@@ -78,67 +72,33 @@ class FlowClient:
         self._last_model_key = None
         self._recaptcha_provider = None
         self._recaptcha_fail_count = 0
+        # Do not automate Google OAuth sign-in.
+        # Use existing logged-in browser profile/cookies only.
+        self._allow_playwright_sign_in = False
 
-    def _make_sapisidhash(self, origin: str = "https://aisandbox-pa.googleapis.com") -> str:
-        """Compute SAPISIDHASH auth header value from SAPISID cookie."""
-        ts = str(int(time.time()))
-        raw = f"{ts} {self._sapisid} {origin}"
-        digest = hashlib.sha1(raw.encode()).hexdigest()
-        return f"SAPISIDHASH {ts}_{digest}"
-
-    def _get_auth_header(self, origin: str = "https://aisandbox-pa.googleapis.com") -> str:
-        """Return the Authorization header value based on current auth mode."""
-        if self._auth_mode == self.AUTH_SAPISIDHASH and self._sapisid:
-            return self._make_sapisidhash(origin)
+    def _get_auth_header(self, origin: str = "") -> str:
+        """Return the Authorization header value."""
         return f"Bearer {self._token}"
 
-    async def _extract_sapisid(self) -> str | None:
-        """Extract SAPISID cookie from browser context."""
+    async def _ensure_labs_session_page(self):
+        """Open Labs/Flow page using the existing browser profile cookies."""
         try:
-            all_cookies = await self._page.context.cookies()
-            for c in all_cookies:
-                if c.get("name") == "SAPISID" and "google.com" in c.get("domain", ""):
-                    return c.get("value")
-                if c.get("name") == "__Secure-3PAPISID" and "google.com" in c.get("domain", ""):
-                    return c.get("value")
-        except Exception as e:
-            log.debug(f"SAPISID extraction error: {e}")
-        return None
+            current_url = self._page.url or ""
+        except Exception:
+            current_url = ""
 
-    async def _try_sapisid_auth(self) -> bool:
-        """Try to authenticate using SAPISID hash (cookie-based auth)."""
-        sapisid = await self._extract_sapisid()
-        if not sapisid:
-            log.debug("No SAPISID cookie found")
-            return False
-
-        self._sapisid = sapisid
-        auth_header = self._make_sapisidhash()
-        cookie_dict = await self._get_cookies_for_httpx()
+        if "labs.google" not in current_url:
+            await self._page.goto(
+                "https://labs.google/fx/tools/flow?from=imagefx",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await asyncio.sleep(2)
 
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=15, cookies=cookie_dict) as client:
-                resp = await client.get(
-                    f"{AISANDBOX_BASE}/credits",
-                    headers={
-                        "Authorization": auth_header,
-                        "Origin": "https://labs.google",
-                        "Referer": "https://labs.google/",
-                        "x-client-data": X_CLIENT_DATA,
-                    },
-                )
-            if resp.status_code == 200:
-                log.info("SAPISID hash auth succeeded (cookie-based)")
-                self._auth_mode = self.AUTH_SAPISIDHASH
-                self._token = f"SAPISID:{sapisid[:8]}..."
-                return True
-            log.debug(f"SAPISID auth test HTTP {resp.status_code}")
-        except Exception as e:
-            log.debug(f"SAPISID auth test failed: {e}")
-
-        self._sapisid = None
-        return False
+            await self._dismiss_overlays()
+        except Exception:
+            pass
 
     async def _fetch_session_token(self):
         """Fetch access token from NextAuth session endpoint. Returns token or None."""
@@ -155,7 +115,10 @@ class FlowClient:
             if token:
                 log.info("Session token obtained")
                 return token
-            log.debug(f"Session response (no token): {json.dumps(result, ensure_ascii=False)[:300]}")
+            log.warning(
+                "Labs session endpoint returned no token: "
+                f"{json.dumps(result, ensure_ascii=False)[:500]}"
+            )
         except Exception as e:
             log.debug(f"Session fetch error: {e}")
         return None
@@ -264,7 +227,18 @@ class FlowClient:
             log.warning(f"Still on: {(self._page.url or '')[:80]}")
 
     async def _try_sign_in(self):
-        """Attempt Google sign-in on labs.google.
+        """Disabled — Playwright OAuth sign-in is no longer used.
+
+        Google rejects automated OAuth from Playwright browsers.
+        Use existing browser profile cookies instead.
+        """
+        raise RuntimeError(
+            "Playwright OAuth sign-in is disabled. "
+            "Use existing browser profile cookies instead."
+        )
+
+    async def _try_sign_in_legacy(self):
+        """Legacy sign-in flow — kept for reference but not called.
 
         Strategy (in order):
         1. Navigate to NextAuth sign-in endpoint directly (most reliable)
@@ -483,13 +457,12 @@ class FlowClient:
             return False
 
     async def ensure_token(self):
-        """Get authentication for Google aisandbox API.
+        """Get ya29.* access token from existing Labs/Google cookies only.
 
-        Tries in order:
-        1. Cached token (from previous call)
-        2. NextAuth session token (ya29.* from labs.google session cookie)
-        3. SAPISID hash auth (computed from Google SAPISID cookie — no sign-in needed)
-        4. NextAuth sign-in flow (click "Sign in with Google" etc.)
+        Important:
+        - Do not automate Google OAuth sign-in in Playwright.
+        - If cookies are expired/missing, ask the user to login manually in the
+          same Chrome profile used by NAVTools.
         """
         if self._token:
             return self._token
@@ -500,52 +473,46 @@ class FlowClient:
                 "This usually means Chrome crashed during startup — try running again."
             )
 
-        log.info("Getting session token...")
-        if "labs.google" not in (self._page.url or ""):
-            await self._page.goto("https://labs.google/fx", wait_until="load", timeout=30000)
-            await asyncio.sleep(3)
+        log.info("Getting session token from existing cookies...")
 
-        # Attempt 1: NextAuth session might already be valid
+        await self._ensure_labs_session_page()
+
+        # Attempt 1: use current Labs cookies.
         token = await self._fetch_session_token()
         if token:
             self._token = token
-            self._auth_mode = self.AUTH_BEARER
             return token
 
-        # Attempt 2: SAPISID hash auth (uses Google cookies directly, no sign-in needed)
-        log.info("No session token — trying SAPISID cookie auth...")
-        if await self._try_sapisid_auth():
-            return self._token
+        # Attempt 2: reload Labs/Flow once, then retry session endpoint.
+        try:
+            log.info("No session token from cookies — reloading Flow page once...")
+            await self._page.goto(
+                "https://labs.google/fx/tools/flow?from=imagefx",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await asyncio.sleep(3)
 
-        # Attempt 3: NextAuth sign-in flow (may be blocked by Google)
-        log.info("SAPISID auth failed — attempting sign-in flow...")
-        signed_in = await self._try_sign_in()
-
-        if signed_in:
-            if "labs.google" not in (self._page.url or ""):
-                await self._page.goto("https://labs.google/fx", wait_until="load", timeout=30000)
-                await asyncio.sleep(3)
+            try:
+                await self._dismiss_overlays()
+            except Exception:
+                pass
 
             token = await self._fetch_session_token()
             if token:
                 self._token = token
-                self._auth_mode = self.AUTH_BEARER
                 return token
+        except Exception as e:
+            log.warning(f"Flow page reload before session retry failed: {e}")
 
-        # Attempt 4: try direct tool URL which may trigger auth
-        log.info("Retrying via direct tool URL...")
-        await self._page.goto("https://labs.google/fx/tools/image-fx", wait_until="load", timeout=30000)
-        await asyncio.sleep(3)
-
-        token = await self._fetch_session_token()
-        if token:
-            self._token = token
-            self._auth_mode = self.AUTH_BEARER
-            return token
-
+        # Do not call _try_sign_in().
+        # Google often rejects automated OAuth sign-in from Playwright.
         raise RuntimeError(
-            "Could not authenticate with Google. "
-            "Cookies may be expired — try renewing in Settings → Tài khoản Google → Gia hạn"
+            "Could not get Google session access token from existing cookies. "
+            "NAVTools no longer attempts OAuth sign-in through Playwright. "
+            "Open the same Chrome profile used by NAVTools, login to Google manually, "
+            "open https://labs.google/fx/tools/flow?from=imagefx, accept any Terms/Consent, "
+            "then run the task again."
         )
 
     def set_recaptcha_provider(self, provider):
@@ -556,8 +523,6 @@ class FlowClient:
         """Force refresh of the session token."""
         log.info("Renewing session token...")
         self._token = None
-        self._auth_mode = None
-        self._sapisid = None
         token = await self.ensure_token()
         provider = self._recaptcha_provider
         if provider and getattr(provider, "is_running", False):
