@@ -148,140 +148,199 @@ class FlowClient:
 
         return dismissed
 
+    async def _handle_google_account_picker(self):
+        """Handle the Google account picker page if we land on accounts.google.com."""
+        current_url = self._page.url or ""
+        if "accounts.google.com" not in current_url:
+            return
+
+        log.info(f"On Google account picker: {current_url[:80]}")
+        # Try clicking the account email
+        try:
+            account_el = await self._page.wait_for_selector(
+                '[data-email], .JDAKTe, div[role="link"]',
+                timeout=10000,
+            )
+            if account_el:
+                await account_el.click()
+                log.info("Clicked account, waiting for redirect back...")
+        except Exception:
+            pass
+
+        # Wait for redirect back to labs.google
+        try:
+            await self._page.wait_for_url("**/labs.google/**", timeout=30000)
+            log.info("Redirected back to labs.google")
+        except Exception:
+            log.warning(f"Still on: {(self._page.url or '')[:80]}")
+
     async def _try_sign_in(self):
-        """Attempt Google sign-in on labs.google via popup or redirect."""
-        # Dismiss any overlays (cookie consent, terms, etc.) first
+        """Attempt Google sign-in on labs.google.
+
+        Strategy (in order):
+        1. Navigate to NextAuth sign-in endpoint directly (most reliable)
+        2. Extract OAuth URL from page and navigate directly
+        3. Click Sign-in button with force=True
+        """
         await self._dismiss_overlays()
 
-        selectors = [
-            'a[href*="accounts.google.com"]',
-            'button:has-text("Sign in")',
-            'a:has-text("Sign in")',
-            'button:has-text("Đăng nhập")',
-            'a:has-text("Đăng nhập")',
-            '[data-action="sign-in"]',
-        ]
-
-        btn = None
-        for sel in selectors:
-            try:
-                btn = await self._page.query_selector(sel)
-                if btn and await btn.is_visible():
-                    log.info(f"Found sign-in button: {sel}")
-                    break
-                btn = None
-            except Exception:
-                btn = None
-
-        if not btn:
-            log.warning("No sign-in button found on page")
-            return False
-
-        # Try 1: popup flow (Google OAuth opens in new window)
+        # Try 1: NextAuth CSRF + sign-in endpoint (bypasses UI entirely)
         try:
-            log.info("Attempting sign-in via popup...")
-            async with self._page.context.expect_page(timeout=5000) as page_info:
-                await btn.click(force=True)
-            popup = await page_info.value
-            log.info(f"Popup opened: {popup.url[:80]}")
-            # Google cookies should auto-complete the OAuth flow
-            try:
-                await popup.wait_for_event("close", timeout=30000)
-                log.info("Sign-in popup closed")
-            except Exception:
-                # Popup didn't close — try to select account if prompted
-                try:
-                    account_btn = await popup.query_selector(
-                        '[data-email], .JDAKTe, div[role="link"]'
-                    )
-                    if account_btn:
-                        log.info("Clicking account in popup...")
-                        await account_btn.click()
-                        await popup.wait_for_event("close", timeout=15000)
-                except Exception as e:
-                    log.warning(f"Popup interaction failed: {e}")
-                    try:
-                        await popup.close()
-                    except Exception:
-                        pass
-            # Wait for main page to process the sign-in
-            await asyncio.sleep(3)
-            return True
+            log.info("Trying NextAuth direct sign-in...")
+            csrf_result = await self._page.evaluate("""async () => {
+                try {
+                    const r = await fetch('/fx/api/auth/csrf', {credentials: 'include'});
+                    if (r.ok) return await r.json();
+                } catch(e) {}
+                return null;
+            }""")
+            csrf_token = (csrf_result or {}).get("csrfToken")
+
+            if csrf_token:
+                log.info(f"Got CSRF token, initiating Google sign-in...")
+                # Navigate to the NextAuth sign-in page for Google provider
+                signin_url = "https://labs.google/fx/api/auth/signin/google"
+                await self._page.goto(signin_url, wait_until="load", timeout=30000)
+                await asyncio.sleep(2)
+
+                # This should redirect to Google OAuth. Since we have Google
+                # cookies in the persistent context, it may auto-complete.
+                await self._handle_google_account_picker()
+                await asyncio.sleep(2)
+
+                # Check if we're back on labs.google
+                if "labs.google" in (self._page.url or ""):
+                    token = await self._fetch_session_token()
+                    if token:
+                        log.info("NextAuth direct sign-in succeeded!")
+                        self._token = token
+                        return True
+                    log.info("NextAuth sign-in redirected back but no token yet")
+                else:
+                    log.info(f"After NextAuth sign-in, on: {(self._page.url or '')[:80]}")
         except Exception as e:
-            log.info(f"Popup flow failed ({e}), trying redirect...")
+            log.info(f"NextAuth direct sign-in failed: {e}")
 
-        # Try 2: redirect flow — use force=True to bypass overlays
+        # Try 2: Extract OAuth URL from page source and navigate
         try:
-            await btn.click(force=True)
-            await asyncio.sleep(2)
+            log.info("Trying to extract OAuth URL from page...")
+            if "labs.google" not in (self._page.url or ""):
+                await self._page.goto("https://labs.google/fx", wait_until="load", timeout=30000)
+                await asyncio.sleep(3)
 
-            current_url = self._page.url
-            if "accounts.google.com" in current_url:
-                log.info("Redirected to Google sign-in, waiting for account selection...")
-                # Try to click the account if prompted
+            oauth_url = await self._page.evaluate("""() => {
+                // Look for Google OAuth URLs in the page
+                const links = document.querySelectorAll('a[href*="accounts.google.com/o/oauth2"]');
+                if (links.length > 0) return links[0].href;
+
+                // Check meta tags, scripts, etc.
+                const scripts = document.querySelectorAll('script');
+                for (const s of scripts) {
+                    const text = s.textContent || '';
+                    const match = text.match(/(https:\\/\\/accounts\\.google\\.com\\/o\\/oauth2[^"'\\s]+)/);
+                    if (match) return match[1];
+                }
+
+                // Check data attributes on sign-in buttons
+                const btns = document.querySelectorAll('button, a');
+                for (const b of btns) {
+                    const text = b.textContent || '';
+                    if (text.includes('Sign in') || text.includes('Đăng nhập')) {
+                        // Check onclick, data attributes
+                        const onclick = b.getAttribute('onclick') || '';
+                        const match2 = onclick.match(/(https:\\/\\/accounts\\.google\\.com[^"'\\s]+)/);
+                        if (match2) return match2[1];
+                    }
+                }
+                return null;
+            }""")
+
+            if oauth_url:
+                log.info(f"Found OAuth URL, navigating directly...")
+                await self._page.goto(oauth_url, wait_until="load", timeout=30000)
+                await asyncio.sleep(2)
+                await self._handle_google_account_picker()
+                await asyncio.sleep(2)
+
+                if "labs.google" in (self._page.url or ""):
+                    token = await self._fetch_session_token()
+                    if token:
+                        log.info("OAuth direct navigation succeeded!")
+                        self._token = token
+                        return True
+        except Exception as e:
+            log.info(f"OAuth URL extraction failed: {e}")
+
+        # Try 3: Click sign-in button (popup or redirect)
+        try:
+            if "labs.google" not in (self._page.url or ""):
+                await self._page.goto("https://labs.google/fx", wait_until="load", timeout=30000)
+                await asyncio.sleep(3)
+                await self._dismiss_overlays()
+
+            btn = None
+            for sel in ['a[href*="accounts.google.com"]', 'button:has-text("Sign in")',
+                        'a:has-text("Sign in")', 'button:has-text("Đăng nhập")']:
                 try:
-                    account_el = await self._page.wait_for_selector(
-                        '[data-email], .JDAKTe, div[role="link"]',
-                        timeout=10000,
-                    )
-                    if account_el:
-                        await account_el.click()
-                        log.info("Clicked account, waiting for redirect back...")
+                    btn = await self._page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        log.info(f"Found sign-in button: {sel}")
+                        break
+                    btn = None
+                except Exception:
+                    btn = None
+
+            if btn:
+                # Try popup first
+                try:
+                    log.info("Attempting sign-in via popup...")
+                    async with self._page.context.expect_page(timeout=5000) as page_info:
+                        await btn.click(force=True)
+                    popup = await page_info.value
+                    log.info(f"Popup opened: {popup.url[:80]}")
+                    try:
+                        await popup.wait_for_event("close", timeout=30000)
+                        log.info("Sign-in popup closed")
+                    except Exception:
+                        try:
+                            account_btn = await popup.query_selector('[data-email], .JDAKTe')
+                            if account_btn:
+                                await account_btn.click()
+                                await popup.wait_for_event("close", timeout=15000)
+                        except Exception:
+                            try:
+                                await popup.close()
+                            except Exception:
+                                pass
+                    await asyncio.sleep(3)
+                    return True
+                except Exception as e:
+                    log.info(f"Popup failed ({e}), trying JS navigation...")
+
+                # Try extracting href from the button/link and navigating
+                try:
+                    href = await btn.get_attribute("href")
+                    if href and "accounts.google.com" in href:
+                        log.info(f"Navigating to sign-in href directly...")
+                        await self._page.goto(href, wait_until="load", timeout=30000)
+                        await asyncio.sleep(2)
+                        await self._handle_google_account_picker()
+                        await asyncio.sleep(2)
+                        return "labs.google" in (self._page.url or "")
                 except Exception:
                     pass
 
-                # Wait for redirect back to labs.google
+                # Force click as last resort
                 try:
-                    await self._page.wait_for_url("**/labs.google/**", timeout=30000)
-                    log.info("Redirected back to labs.google")
+                    await btn.click(force=True)
+                    await asyncio.sleep(3)
+                    if "accounts.google.com" in (self._page.url or ""):
+                        await self._handle_google_account_picker()
+                        return True
                 except Exception:
-                    log.warning(f"Still on: {self._page.url[:80]}")
-
-            await asyncio.sleep(3)
-            return True
+                    pass
         except Exception as e:
-            log.warning(f"Redirect sign-in failed: {e}")
-
-        # Try 3: use JavaScript to click the sign-in link directly
-        try:
-            log.info("Trying JS click on sign-in link...")
-            clicked = await self._page.evaluate("""() => {
-                const links = [...document.querySelectorAll('a[href*="accounts.google.com"]')];
-                if (links.length > 0) {
-                    links[0].click();
-                    return true;
-                }
-                const buttons = [...document.querySelectorAll('button')].filter(
-                    b => b.textContent.includes('Sign in') || b.textContent.includes('Đăng nhập')
-                );
-                if (buttons.length > 0) {
-                    buttons[0].click();
-                    return true;
-                }
-                return false;
-            }""")
-            if clicked:
-                log.info("JS click succeeded, waiting for navigation...")
-                await asyncio.sleep(3)
-
-                if "accounts.google.com" in (self._page.url or ""):
-                    try:
-                        account_el = await self._page.wait_for_selector(
-                            '[data-email], .JDAKTe, div[role="link"]',
-                            timeout=10000,
-                        )
-                        if account_el:
-                            await account_el.click()
-                    except Exception:
-                        pass
-                    try:
-                        await self._page.wait_for_url("**/labs.google/**", timeout=30000)
-                    except Exception:
-                        pass
-                await asyncio.sleep(3)
-                return True
-        except Exception as e:
-            log.warning(f"JS sign-in failed: {e}")
+            log.warning(f"Button sign-in failed: {e}")
 
         return False
 
