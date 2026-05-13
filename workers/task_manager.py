@@ -173,6 +173,27 @@ class TaskWorker(QThread):
         except Exception as e:
             log.warning(f"SubprocessTokenProvider setup failed (will use fallback): {e}")
 
+        # SubprocessTokenProvider startup takes ~5s; the main page may
+        # have been closed/crashed by Chrome during that time.  Re-acquire
+        # the page if it is no longer usable.
+        try:
+            await page.evaluate("1+1")
+        except Exception:
+            log.warning("Main page closed during SubprocessTokenProvider setup, reconnecting...")
+            try:
+                page = await self.browser_manager.get_page(
+                    account_id=account.id,
+                    email=account.email,
+                    proxy=account.proxy,
+                    cookie_path=account.cookie_path,
+                    url=url,
+                )
+                client._page = page
+                log.info("Reconnected to browser page")
+            except Exception as e:
+                self.signals.task_error.emit(task_id, f"Không thể kết nối lại trình duyệt: {e}")
+                return
+
         config = task if isinstance(task, dict) else {}
         aspect_ratio = config.get("aspect_ratio", "16:9")
         quality = config.get("quality", "720p")
